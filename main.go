@@ -103,8 +103,9 @@ func main() {
 		}
 
 		ext := strings.ToLower(filepath.Ext(filePath))
-		if ext != ".pdf" && ext != ".epub" && ext != ".docx" && ext != ".html" && ext != ".htm" {
-			fmt.Printf("Unsupported file format: %s\nSupported formats: .pdf, .epub, .docx, .html\n", ext)
+		if ext != ".pdf" && ext != ".epub" && ext != ".docx" && ext != ".html" && ext != ".htm" &&
+			ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
+			fmt.Printf("Unsupported file format: %s\nSupported formats: .pdf, .epub, .docx, .html, .png, .jpg\n", ext)
 			return
 		}
 
@@ -138,7 +139,7 @@ OPTIONS:
     -v, --version    Show version
 
 SUPPORTED FORMATS:
-    PDF, EPUB, DOCX, HTML
+    PDF, EPUB, DOCX, HTML, PNG, JPG/JPEG
 
 KEYBOARD SHORTCUTS:
     Navigation:
@@ -196,7 +197,7 @@ func selectFileWithPickerBroadSearch() (string, error) {
 	}
 	allFiles := searcher.GetAllFiles()
 	if len(allFiles) == 0 {
-		return "", fmt.Errorf("no PDF or EPUB files found in common directories")
+		return "", fmt.Errorf("no supported files found in common directories")
 	}
 	picker := NewFilePicker(searcher)
 	return picker.Run()

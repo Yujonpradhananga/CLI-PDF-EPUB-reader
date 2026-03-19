@@ -62,6 +62,11 @@ func (d *DocumentViewer) displayCurrentPage() {
 }
 
 func (d *DocumentViewer) getPageContentType(pageNum int) string {
+	// Standalone images are always rendered as images
+	if d.isImage {
+		return "image"
+	}
+
 	// Honor forced mode if set (toggled with 't')
 	if d.forceMode == "text" {
 		return "text"
@@ -567,7 +572,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 		p("  - HTML entities are converted to readable text")
 	}
 	p("")
-	p("Supported formats: PDF, EPUB, DOCX, HTML")
+	p("Supported formats: PDF, EPUB, DOCX, HTML, PNG, JPG")
 	p("")
 	p(strings.Repeat("=", termWidth))
 	p("Press any key to return...")

@@ -71,6 +71,32 @@ func (d *DocumentViewer) renderPageImageAligned(pageNum, maxWidth, maxHeight int
 	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, actualPixelWidth, actualPixelHeight, termType)
 }
 
+// scaleImage performs nearest-neighbor scaling of an image to the target dimensions.
+func scaleImage(src image.Image, targetW, targetH int) image.Image {
+	if targetW <= 0 || targetH <= 0 {
+		return src
+	}
+	bounds := src.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	if srcW == targetW && srcH == targetH {
+		return src
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	for y := 0; y < targetH; y++ {
+		srcY := bounds.Min.Y + y*srcH/targetH
+		for x := 0; x < targetW; x++ {
+			srcX := bounds.Min.X + x*srcW/targetW
+			r, g, b, a := src.At(srcX, srcY).RGBA()
+			i := (y*dst.Stride) + x*4
+			dst.Pix[i+0] = uint8(r >> 8)
+			dst.Pix[i+1] = uint8(g >> 8)
+			dst.Pix[i+2] = uint8(b >> 8)
+			dst.Pix[i+3] = uint8(a >> 8)
+		}
+	}
+	return dst
+}
+
 func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string) (string, int, int, int, int, error) {
 	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
 		return "", 0, 0, 0, 0, err
@@ -93,15 +119,24 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	// Get page dimensions at 72 DPI to calculate proper render DPI
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
-	if err != nil {
-		return "", 0, 0, 0, 0, err
+	// Get aspect ratio from source
+	var aspectRatio float64
+	var pageWidthAt72, pageHeightAt72 int
+
+	if d.isImage {
+		srcBounds := d.sourceImage.Bounds()
+		aspectRatio = float64(srcBounds.Dy()) / float64(srcBounds.Dx())
+	} else {
+		// Get page dimensions at 72 DPI to calculate proper render DPI
+		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		if err != nil {
+			return "", 0, 0, 0, 0, err
+		}
+		testBounds := testImg.Bounds()
+		pageWidthAt72 = testBounds.Dx()
+		pageHeightAt72 = testBounds.Dy()
+		aspectRatio = float64(pageHeightAt72) / float64(pageWidthAt72)
 	}
-	testBounds := testImg.Bounds()
-	pageWidthAt72 := testBounds.Dx()
-	pageHeightAt72 := testBounds.Dy()
-	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
 	// Calculate final dimensions based on fit mode
 	var finalWidth, finalHeight int
@@ -125,33 +160,37 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		}
 	}
 
-	// Calculate DPI needed to render at exactly the right size
-	dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
-	dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
-	dpi := dpiForWidth
-	if dpiForHeight < dpi {
-		dpi = dpiForHeight
-	}
+	// Get the image at final dimensions
+	var img image.Image
+	if d.isImage {
+		img = scaleImage(d.sourceImage, finalWidth, finalHeight)
+	} else {
+		// Calculate DPI needed to render at exactly the right size
+		dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
+		dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
+		dpi := dpiForWidth
+		if dpiForHeight < dpi {
+			dpi = dpiForHeight
+		}
 
-	// Clamp DPI to reasonable range
-	// Sixel terminals (Foot) are slower, so use lower max DPI for better performance
-	if dpi < 36 {
-		dpi = 36
-	}
-	maxDPI := 300.0
-	if termType != "kitty" {
-		// Sixel terminals: reduce max DPI significantly for faster rendering
-		// 100 DPI is still very readable while being much faster to encode
-		maxDPI = 100.0
-	}
-	if dpi > maxDPI {
-		dpi = maxDPI
-	}
+		// Clamp DPI to reasonable range
+		if dpi < 36 {
+			dpi = 36
+		}
+		maxDPI := 300.0
+		if termType != "kitty" {
+			maxDPI = 100.0
+		}
+		if dpi > maxDPI {
+			dpi = maxDPI
+		}
 
-	// Render at calculated DPI - no resizing needed
-	img, err := d.doc.ImageDPI(pageNum, dpi)
-	if err != nil {
-		return "", 0, 0, 0, 0, err
+		// Render at calculated DPI - no resizing needed
+		var err error
+		img, err = d.doc.ImageDPI(pageNum, dpi)
+		if err != nil {
+			return "", 0, 0, 0, 0, err
+		}
 	}
 
 	// Apply dark mode
@@ -212,14 +251,22 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
-	if err != nil {
-		return nil, err
+	var aspectRatio float64
+	var pageWidthAt72, pageHeightAt72 int
+
+	if d.isImage {
+		srcBounds := d.sourceImage.Bounds()
+		aspectRatio = float64(srcBounds.Dy()) / float64(srcBounds.Dx())
+	} else {
+		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		if err != nil {
+			return nil, err
+		}
+		testBounds := testImg.Bounds()
+		pageWidthAt72 = testBounds.Dx()
+		pageHeightAt72 = testBounds.Dy()
+		aspectRatio = float64(pageHeightAt72) / float64(pageWidthAt72)
 	}
-	testBounds := testImg.Bounds()
-	pageWidthAt72 := testBounds.Dx()
-	pageHeightAt72 := testBounds.Dy()
-	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
 	var finalWidth, finalHeight int
 	switch d.fitMode {
@@ -242,27 +289,33 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		}
 	}
 
-	dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
-	dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
-	dpi := dpiForWidth
-	if dpiForHeight < dpi {
-		dpi = dpiForHeight
-	}
+	var img image.Image
+	if d.isImage {
+		img = scaleImage(d.sourceImage, finalWidth, finalHeight)
+	} else {
+		dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
+		dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
+		dpi := dpiForWidth
+		if dpiForHeight < dpi {
+			dpi = dpiForHeight
+		}
 
-	if dpi < 36 {
-		dpi = 36
-	}
-	maxDPI := 300.0
-	if termType != "kitty" {
-		maxDPI = 100.0
-	}
-	if dpi > maxDPI {
-		dpi = maxDPI
-	}
+		if dpi < 36 {
+			dpi = 36
+		}
+		maxDPI := 300.0
+		if termType != "kitty" {
+			maxDPI = 100.0
+		}
+		if dpi > maxDPI {
+			dpi = maxDPI
+		}
 
-	img, err := d.doc.ImageDPI(pageNum, dpi)
-	if err != nil {
-		return nil, err
+		var err error
+		img, err = d.doc.ImageDPI(pageNum, dpi)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	switch d.darkMode {
@@ -424,44 +477,68 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	termType := d.detectTerminalType()
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
-	// Compute DPI so that 55% of the page height fills termHeight exactly.
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
-	if err != nil {
-		return 0
-	}
-	pageHeightAt72 := testImg.Bounds().Dy()
+	var img image.Image
 
-	targetCropPixels := float64(termHeight) * pixelsPerLine
-	targetFullPixels := targetCropPixels / 0.55
+	if d.isImage {
+		// For standalone images, scale so that 55% of the height fills the terminal
+		srcBounds := d.sourceImage.Bounds()
+		srcW, srcH := srcBounds.Dx(), srcBounds.Dy()
+		aspectRatio := float64(srcW) / float64(srcH)
 
-	scale := d.scaleFactor
-	if scale == 0 {
-		scale = 1.0
-	}
-	dpi := targetFullPixels / float64(pageHeightAt72) * 72.0 * scale
+		targetCropPixels := float64(termHeight) * pixelsPerLine
+		targetFullH := int(targetCropPixels / 0.55)
 
-	if dpi < 36 {
-		dpi = 36
-	}
-	maxDPI := 300.0
-	if termType != "kitty" {
-		maxDPI = 100.0
-	}
-	if dpi > maxDPI {
-		dpi = maxDPI
-	}
+		scale := d.scaleFactor
+		if scale == 0 {
+			scale = 1.0
+		}
+		targetFullH = int(float64(targetFullH) * scale)
+		targetFullW := int(float64(targetFullH) * aspectRatio)
 
-	rawImg, err := d.doc.ImageDPI(pageNum, dpi)
-	if err != nil {
-		return 0
-	}
+		if targetFullW != srcW || targetFullH != srcH {
+			img = scaleImage(d.sourceImage, targetFullW, targetFullH)
+		} else {
+			img = d.sourceImage
+		}
+	} else {
+		// Compute DPI so that 55% of the page height fills termHeight exactly.
+		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		if err != nil {
+			return 0
+		}
+		pageHeightAt72 := testImg.Bounds().Dy()
 
-	var img image.Image = rawImg
+		targetCropPixels := float64(termHeight) * pixelsPerLine
+		targetFullPixels := targetCropPixels / 0.55
+
+		scale := d.scaleFactor
+		if scale == 0 {
+			scale = 1.0
+		}
+		dpi := targetFullPixels / float64(pageHeightAt72) * 72.0 * scale
+
+		if dpi < 36 {
+			dpi = 36
+		}
+		maxDPI := 300.0
+		if termType != "kitty" {
+			maxDPI = 100.0
+		}
+		if dpi > maxDPI {
+			dpi = maxDPI
+		}
+
+		rawImg, err := d.doc.ImageDPI(pageNum, dpi)
+		if err != nil {
+			return 0
+		}
+		img = rawImg
+	}
 	switch d.darkMode {
 	case "smart":
-		img = smartInvert(rawImg)
+		img = smartInvert(img)
 	case "invert":
-		img = simpleInvert(rawImg)
+		img = simpleInvert(img)
 	}
 
 	bounds := img.Bounds()
@@ -469,6 +546,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	fullW := bounds.Dx()
 
 	// Crop enough to fill termHeight; ideally 55%, but more if DPI was clamped.
+	targetCropPixels := float64(termHeight) * pixelsPerLine
 	targetCropH := int(targetCropPixels)
 	cropH := fullH * 55 / 100
 	if cropH < targetCropH && targetCropH <= fullH {

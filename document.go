@@ -4,6 +4,8 @@ import (
 	"crypto/md5"
 	"fmt"
 	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +49,8 @@ type DocumentViewer struct {
 	cropBottom     float64 // fraction to cut from bottom edge
 	cropLeft       float64 // fraction to cut from left edge
 	cropRight      float64 // fraction to cut from right edge
+	isImage        bool        // true for standalone image files (PNG, JPG)
+	sourceImage    image.Image // loaded image for standalone image viewing
 }
 
 func NewDocumentViewer(path string) *DocumentViewer {
@@ -73,12 +77,31 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		cropLeft:      cfg.CropLeft,
 		cropRight:     cfg.CropRight,
 		isReflowable:  fileType == "html" || fileType == "htm",
+		isImage:       fileType == "png" || fileType == "jpg" || fileType == "jpeg",
 	}
 
 	return dv
 }
 
 func (d *DocumentViewer) Open() error {
+	if d.isImage {
+		f, err := os.Open(d.path)
+		if err != nil {
+			return fmt.Errorf("error opening image: %v", err)
+		}
+		defer f.Close()
+		img, _, err := image.Decode(f)
+		if err != nil {
+			return fmt.Errorf("error decoding image: %v", err)
+		}
+		d.sourceImage = img
+		d.textPages = []int{0}
+		if info, err := os.Stat(d.path); err == nil {
+			d.lastModTime = info.ModTime()
+		}
+		return nil
+	}
+
 	doc, err := fitz.New(d.path)
 	if err != nil {
 		return fmt.Errorf("error opening %s: %v", d.fileType, err)
@@ -270,7 +293,9 @@ func (d *DocumentViewer) checkColorVariance(img image.Image) float64 {
 }
 
 func (d *DocumentViewer) Run() bool {
-	defer d.doc.Close()
+	if d.doc != nil {
+		defer d.doc.Close()
+	}
 	defer d.cleanup()
 	defer d.saveConfig()
 
@@ -459,6 +484,21 @@ func (d *DocumentViewer) checkAndReload() bool {
 				break
 			}
 			lastSize = newInfo.Size()
+		}
+
+		if d.isImage {
+			f, err := os.Open(d.path)
+			if err != nil {
+				return false
+			}
+			defer f.Close()
+			img, _, err := image.Decode(f)
+			if err != nil {
+				return false
+			}
+			d.sourceImage = img
+			d.skipClear = true
+			return true
 		}
 
 		// Suppress stderr during document open
@@ -692,6 +732,9 @@ end tell
 }
 
 func (d *DocumentViewer) startSearch(inputChan <-chan byte) {
+	if d.isImage {
+		return // no text to search in standalone images
+	}
 	_, rows := d.getTerminalSize()
 	fmt.Printf("\033[%d;1H\033[K", rows) // bottom line
 	fmt.Print("\033[?25h")                // show cursor

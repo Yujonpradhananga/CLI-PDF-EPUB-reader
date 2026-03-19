@@ -44,7 +44,7 @@ func (fs *FileSearcher) ScanDirectories() error {
 		filepath.Join(homeDir, ".local/share/books"),
 	}
 
-	fmt.Println("Scanning for PDF and EPUB files...")
+	fmt.Println("Scanning for documents and images...")
 	fmt.Println("This may take a moment on first run...")
 
 	// Use a map to track unique files and avoid duplicates
@@ -77,7 +77,8 @@ func (fs *FileSearcher) ScanDirectories() error {
 			// Only collect supported files
 			if !info.IsDir() {
 				ext := strings.ToLower(filepath.Ext(path))
-				if ext == ".pdf" || ext == ".epub" || ext == ".docx" {
+				if ext == ".pdf" || ext == ".epub" || ext == ".docx" ||
+					ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
 					uniqueFiles[path] = true
 				}
 			}
@@ -121,7 +122,8 @@ func (fs *FileSearcher) ScanDirectory(dir string) error {
 
 
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".pdf" || ext == ".epub" || ext == ".docx" || ext == ".html" || ext == ".htm" {
+		if ext == ".pdf" || ext == ".epub" || ext == ".docx" || ext == ".html" || ext == ".htm" ||
+			ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
 			files = append(files, path)
 		}
 
