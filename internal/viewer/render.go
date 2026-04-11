@@ -19,7 +19,8 @@ func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 		return 0
 	}
 
-	imagePath, actualHeight, imageWidthInChars, err := d.savePageAsImage(pageNum, maxWidth, maxHeight)
+	termType := d.detectTerminalType()
+	imagePath, actualHeight, imageWidthInChars, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType)
 	if err != nil {
 		return 0
 	}
@@ -30,10 +31,10 @@ func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars)
+	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, termType)
 }
 
-func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int) (string, int, int, error) {
+func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string) (string, int, int, error) {
 	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
 		return "", 0, 0, err
 	}
@@ -99,8 +100,13 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int) (st
 	if dpi < 36 {
 		dpi = 36
 	}
-	if dpi > 300 {
-		dpi = 300
+	// Kitty handles high-res images natively; Sixel terminals need lower DPI
+	maxDPI := 300.0
+	if termType != "kitty" {
+		maxDPI = 150.0
+	}
+	if dpi > maxDPI {
+		dpi = maxDPI
 	}
 
 	// Render at calculated DPI - no resizing needed
@@ -342,7 +348,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, termType)
 }
 
 func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBottom bool) int {
@@ -350,6 +356,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		return 0
 	}
 
+	termType := d.detectTerminalType()
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
 	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
@@ -448,22 +455,28 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, termType)
 }
 
-func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int) int {
+func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int, termType string) int {
 	if horizontalOffset > 0 {
 		fmt.Printf("\033[%dC", horizontalOffset) // Move cursor right
 	}
 
-	// Use termimg fluent API to control size in terminal cells
 	img, err := termimg.Open(imagePath)
 	if err != nil {
 		return 0
 	}
 
-	// Use ScaleNone - we already rendered at the correct size
-	err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
+	if termType == "kitty" {
+		// Kitty protocol handles Width/Height in cells natively
+		err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
+	} else {
+		// For Sixel/iTerm2: don't set Width/Height — the Sixel encoder
+		// would resize using its own font metrics, causing misalignment.
+		// The image is already at the correct pixel size from our DPI calculation.
+		err = img.Scale(termimg.ScaleNone).Print()
+	}
 	if err != nil {
 		return 0
 	}
