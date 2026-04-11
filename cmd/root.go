@@ -11,7 +11,7 @@ import (
 	"pdf-cli/internal/viewer"
 )
 
-// Execute is the main entry point for the CLI application.
+// the main entry point for the application.
 func Execute() {
 	// Handle --help and -h flags
 	if len(os.Args) > 1 {
@@ -26,14 +26,12 @@ func Execute() {
 		}
 	}
 
-	// Determine if user provided an argument
 	hasArg := len(os.Args) > 1
 	arg := "."
 	if hasArg {
 		arg = os.Args[1]
 	}
 
-	// Expand ~ to home directory
 	if strings.HasPrefix(arg, "~/") {
 		homeDir, _ := os.UserHomeDir()
 		arg = filepath.Join(homeDir, arg[2:])
@@ -145,7 +143,6 @@ func Execute() {
 		if !wantBack {
 			return
 		}
-		// Loop continues - go back to file picker
 	}
 }
 
@@ -206,7 +203,6 @@ For LaTeX workflows, the viewer auto-reloads when the file changes.
 	fmt.Print(help)
 }
 
-// runWithBroadSearch scans common directories and opens a file picker.
 // Returns true if the user wants to go back to the main menu.
 func runWithBroadSearch() bool {
 	for {
@@ -228,11 +224,9 @@ func runWithBroadSearch() bool {
 		if !wantBack {
 			return false
 		}
-		// Loop: user pressed 'b' in viewer, show picker again
 	}
 }
 
-// runWithDirectoryPicker scans the given directory and opens a file picker.
 // Returns true if the user wants to go back to the main menu.
 func runWithDirectoryPicker(dir string) bool {
 	for {

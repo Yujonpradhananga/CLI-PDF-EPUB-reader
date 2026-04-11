@@ -7,8 +7,6 @@ import (
 	"math"
 )
 
-// CropImage trims fractions of each edge from an image.
-// Uses SubImage (zero-copy) when the image type supports it.
 func CropImage(img image.Image, top, bottom, left, right float64) image.Image {
 	if top == 0 && bottom == 0 && left == 0 && right == 0 {
 		return img
@@ -47,7 +45,7 @@ func SmartInvert(src image.Image) image.Image {
 			b8 := float64(b>>8) / 255.0
 
 			h, s, l := RGBToHSL(r8, g8, b8)
-			l = 0.12 + (1.0-l)*0.88 // invert lightness; dark gray bg instead of pure black
+			l = 0.12 + (1.0-l)*0.88
 			nr, ng, nb := HSLToRGB(h, s, l)
 
 			dst.Set(x, y, color.RGBA{
@@ -69,7 +67,6 @@ func SimpleInvert(src image.Image) image.Image {
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			r, g, b, a := src.At(x, y).RGBA()
-			// Invert and remap to gray bg range: 255→30, 0→255
 			nr := 30 + (255-r>>8)*225/255
 			ng := 30 + (255-g>>8)*225/255
 			nb := 30 + (255-b>>8)*225/255
