@@ -15,49 +15,38 @@ import (
 )
 
 func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
-	return d.renderPageImageAligned(pageNum, maxWidth, maxHeight, "center")
-}
-
-func (d *DocumentViewer) renderPageImageAligned(pageNum, maxWidth, maxHeight int, align string) int {
 	if maxHeight <= 0 {
 		return 0
 	}
 
-	termType := d.detectTerminalType()
-	imagePath, actualHeight, imageWidthInChars, actualPixelWidth, actualPixelHeight, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType)
+	imagePath, actualHeight, imageWidthInChars, err := d.savePageAsImage(pageNum, maxWidth, maxHeight)
 	if err != nil {
 		return 0
 	}
 	defer os.Remove(imagePath)
 
-	var horizontalOffset int
-	switch align {
-	case "right":
-		horizontalOffset = maxWidth - imageWidthInChars
-	case "left":
-		horizontalOffset = 0
-	default: // "center"
-		horizontalOffset = (maxWidth - imageWidthInChars) / 2
-	}
+	horizontalOffset := (maxWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, actualPixelWidth, actualPixelHeight, termType)
+	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars)
 }
 
-func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string) (string, int, int, int, int, error) {
+func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int) (string, int, int, error) {
 	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return "", 0, 0, 0, 0, err
+		return "", 0, 0, err
 	}
 
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
+	// Calculate target pixel dimensions based on terminal size
 	horizontalPadding := 4
 	verticalPadding := 3
 	effectiveWidth := termWidth - horizontalPadding
 	effectiveHeight := termHeight - verticalPadding
 
+	// Apply user scale factor
 	scale := d.scaleFactor
 	if scale == 0 {
 		scale = 1.0
@@ -66,15 +55,17 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	// Use Bound() to get page dimensions in points (72 DPI) without rasterizing
-	pageRect, err := d.doc.Bound(pageNum)
+	// Get page dimensions at 72 DPI to calculate proper render DPI
+	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
 	if err != nil {
-		return "", 0, 0, 0, 0, err
+		return "", 0, 0, err
 	}
-	pageWidthAt72 := pageRect.Dx()
-	pageHeightAt72 := pageRect.Dy()
+	testBounds := testImg.Bounds()
+	pageWidthAt72 := testBounds.Dx()
+	pageHeightAt72 := testBounds.Dy()
 	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
+	// Calculate final dimensions based on fit mode
 	var finalWidth, finalHeight int
 	switch d.fitMode {
 	case "height":
@@ -96,6 +87,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		}
 	}
 
+	// Calculate DPI needed to render at exactly the right size
 	dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
 	dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
 	dpi := dpiForWidth
@@ -103,33 +95,21 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		dpi = dpiForHeight
 	}
 
+	// Clamp DPI to reasonable range
 	if dpi < 36 {
 		dpi = 36
 	}
-	maxDPI := 300.0
-	if termType != "kitty" {
-		maxDPI = 100.0
-	}
-	if dpi > maxDPI {
-		dpi = maxDPI
+	if dpi > 300 {
+		dpi = 300
 	}
 
+	// Render at calculated DPI - no resizing needed
 	img, err := d.doc.ImageDPI(pageNum, dpi)
 	if err != nil {
-		return "", 0, 0, 0, 0, err
+		return "", 0, 0, err
 	}
 
-	var finalImg image.Image = img
-	switch d.darkMode {
-	case "smart":
-		finalImg = imgutil.SmartInvert(img)
-	case "invert":
-		finalImg = imgutil.SimpleInvert(img)
-	}
-
-	finalImg = imgutil.CropImage(finalImg, d.cropTop, d.cropBottom, d.cropLeft, d.cropRight)
-
-	bounds := finalImg.Bounds()
+	bounds := img.Bounds()
 	actualWidth := bounds.Dx()
 	actualHeight := bounds.Dy()
 
@@ -145,17 +125,17 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 
 	file, err := os.Create(imagePath)
 	if err != nil {
-		return "", 0, 0, 0, 0, err
+		return "", 0, 0, err
 	}
 	defer file.Close()
 
-	err = png.Encode(file, finalImg)
+	err = png.Encode(file, img)
 	if err != nil {
 		os.Remove(imagePath)
-		return "", 0, 0, 0, 0, err
+		return "", 0, 0, err
 	}
 
-	return imagePath, actualLines, imageWidthInChars, actualWidth, actualHeight, nil
+	return imagePath, actualLines, imageWidthInChars, nil
 }
 
 func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, termType string) (image.Image, error) {
@@ -174,13 +154,13 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	// Use Bound() to get page dimensions in points (72 DPI) without rasterizing
-	pageRect, err := d.doc.Bound(pageNum)
+	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
 	if err != nil {
 		return nil, err
 	}
-	pageWidthAt72 := pageRect.Dx()
-	pageHeightAt72 := pageRect.Dy()
+	testBounds := testImg.Bounds()
+	pageWidthAt72 := testBounds.Dx()
+	pageHeightAt72 := testBounds.Dy()
 	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
 	var finalWidth, finalHeight int
@@ -362,7 +342,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, compositeW, compositeH, termType)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars)
 }
 
 func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBottom bool) int {
@@ -370,15 +350,13 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		return 0
 	}
 
-	termType := d.detectTerminalType()
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
-	// Use Bound() to get page height in points (72 DPI) without rasterizing
-	pageRect, err := d.doc.Bound(pageNum)
+	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
 	if err != nil {
 		return 0
 	}
-	pageHeightAt72 := pageRect.Dy()
+	pageHeightAt72 := testImg.Bounds().Dy()
 
 	targetCropPixels := float64(termHeight) * pixelsPerLine
 	targetFullPixels := targetCropPixels / 0.55
@@ -392,12 +370,8 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	if dpi < 36 {
 		dpi = 36
 	}
-	maxDPI := 300.0
-	if termType != "kitty" {
-		maxDPI = 100.0
-	}
-	if dpi > maxDPI {
-		dpi = maxDPI
+	if dpi > 300 {
+		dpi = 300
 	}
 
 	rawImg, err := d.doc.ImageDPI(pageNum, dpi)
@@ -474,25 +448,22 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, finalW, finalH, termType)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars)
 }
 
-func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int, pixelWidth int, pixelHeight int, termType string) int {
+func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int) int {
 	if horizontalOffset > 0 {
-		fmt.Printf("\033[%dC", horizontalOffset)
+		fmt.Printf("\033[%dC", horizontalOffset) // Move cursor right
 	}
 
+	// Use termimg fluent API to control size in terminal cells
 	img, err := termimg.Open(imagePath)
 	if err != nil {
 		return 0
 	}
 
-	if termType == "kitty" {
-		err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
-	} else {
-		err = img.WidthPixels(pixelWidth).HeightPixels(pixelHeight).Scale(termimg.ScaleFit).Print()
-	}
-
+	// Use ScaleNone - we already rendered at the correct size
+	err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
 	if err != nil {
 		return 0
 	}
