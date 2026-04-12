@@ -68,7 +68,6 @@ func GetPixelSize() (int, int) {
 		Xpixel uint16
 		Ypixel uint16
 	}{}
-
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
 		uintptr(syscall.Stdout),
 		uintptr(syscall.TIOCGWINSZ),
@@ -77,7 +76,6 @@ func GetPixelSize() (int, int) {
 	if errno == 0 && ws.Xpixel > 0 && ws.Ypixel > 0 {
 		return int(ws.Xpixel), int(ws.Ypixel)
 	}
-
 	tty, err := os.OpenFile("/dev/tty", os.O_RDONLY, 0)
 	if err == nil {
 		defer tty.Close()
@@ -90,7 +88,6 @@ func GetPixelSize() (int, int) {
 			return int(ws.Xpixel), int(ws.Ypixel)
 		}
 	}
-
 	return 0, 0
 }
 
@@ -99,23 +96,19 @@ func GetKittyCellSize() (float64, float64) {
 	if DetectType() != "kitty" {
 		return 0, 0
 	}
-
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
 		return 0, 0
 	}
 	defer tty.Close()
-
 	fd := int(tty.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return 0, 0
 	}
 	defer term.Restore(fd, oldState)
-
 	tty.WriteString("\x1b[16t")
 	tty.Sync()
-
 	resultChan := make(chan string, 1)
 	go func() {
 		buf := make([]byte, 32)
@@ -126,7 +119,6 @@ func GetKittyCellSize() (float64, float64) {
 			resultChan <- ""
 		}
 	}()
-
 	select {
 	case response := <-resultChan:
 		if response == "" {
@@ -140,7 +132,6 @@ func GetKittyCellSize() (float64, float64) {
 		}
 	case <-time.After(100 * time.Millisecond):
 	}
-
 	return 0, 0
 }
 
@@ -152,14 +143,11 @@ func DetectCellSize() (float64, float64) {
 			return w, h
 		}
 	}
-
 	if kw, kh := GetKittyCellSize(); kw > 0 && kh > 0 {
 		return kw, kh
 	}
-
 	pixelWidth, pixelHeight := GetPixelSize()
 	charWidth, charHeight := GetSize()
-
 	if pixelWidth > 0 && pixelHeight > 0 && charWidth > 0 && charHeight > 0 {
 		cellWidth := float64(pixelWidth) / float64(charWidth)
 		cellHeight := float64(pixelHeight) / float64(charHeight)
@@ -167,7 +155,6 @@ func DetectCellSize() (float64, float64) {
 			return cellWidth, cellHeight
 		}
 	}
-
 	termType := DetectType()
 	switch termType {
 	case "kitty":
@@ -206,7 +193,6 @@ func ReadSingleChar() byte {
 	if n == 0 {
 		return 0
 	}
-
 	if buf[0] == 27 {
 		b := make([]byte, 1)
 		n, _ = os.Stdin.Read(b)
@@ -249,6 +235,5 @@ func ReadSingleChar() byte {
 		}
 		return 27
 	}
-
 	return buf[0]
 }
