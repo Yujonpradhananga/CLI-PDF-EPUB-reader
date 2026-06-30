@@ -154,6 +154,9 @@ func (d *DocumentViewer) prefetchNeighbors(termWidth, termHeight int) {
 // output), using a state snapshot captured on the main thread.
 func (d *DocumentViewer) warmPage(pageNum, maxWidth, maxHeight int, termType string, rp renderParams, sig string) {
 	defer func() {
+		// A corrupt mid-recompile page must not crash the reader; prefetch is
+		// best-effort, so swallow any panic from the render.
+		recover()
 		d.cacheMu.Lock()
 		delete(d.inFlight, sig)
 		d.cacheMu.Unlock()

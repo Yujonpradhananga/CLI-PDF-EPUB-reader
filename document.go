@@ -1,18 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gen2brain/go-fitz"
@@ -20,36 +21,36 @@ import (
 )
 
 type DocumentViewer struct {
-	doc         *fitz.Document
-	currentPage int
-	textPages   []int
-	path        string
-	oldState    *term.State
-	fileType    string // "pdf" or "epub"
-	tempDir     string // for storing temporary image files
-	forceMode   string // "", "text", or "image" - override auto-detection
-	fitMode      string  // "auto", "height", "width"
-	wantBack     bool    // signal to go back to file picker
-	searchQuery  string  // current search query
-	searchHits   []int     // pages with matches
-	searchHitIdx int       // current index in searchHits
-	scaleFactor  float64   // image scale adjustment (1.0 = default)
-	lastModTime  time.Time // for auto-reload detection
-	cellWidth    float64   // cached cell width in pixels
-	cellHeight   float64   // cached cell height in pixels
-	lastTermCols int       // last known terminal columns (for change detection)
-	lastTermRows int       // last known terminal rows (for change detection)
-	fifoPath      string // path to FIFO for external page jump commands
-	skipClear     bool   // skip screen clear on next display (for smooth reload)
-	htmlPageWidth int    // virtual page width in points for HTML layout (wider = smaller text)
-	isReflowable  bool   // true for HTML (supports layout adjustment)
-	darkMode       string // "": off, "smart": HSL invert, "invert": simple RGB invert
-	dualPageMode   string // "": off, "vertical": stacked, "horizontal": side-by-side, "half": half-page
-	halfPageOffset int    // 0: top half, 1: bottom half (used when dualPageMode == "half")
-	cropTop        float64 // fraction to cut from top edge (0.0–0.45)
-	cropBottom     float64 // fraction to cut from bottom edge
-	cropLeft       float64 // fraction to cut from left edge
-	cropRight      float64 // fraction to cut from right edge
+	doc            *fitz.Document
+	currentPage    int
+	textPages      []int
+	path           string
+	oldState       *term.State
+	fileType       string      // "pdf" or "epub"
+	tempDir        string      // for storing temporary image files
+	forceMode      string      // "", "text", or "image" - override auto-detection
+	fitMode        string      // "auto", "height", "width"
+	wantBack       bool        // signal to go back to file picker
+	searchQuery    string      // current search query
+	searchHits     []int       // pages with matches
+	searchHitIdx   int         // current index in searchHits
+	scaleFactor    float64     // image scale adjustment (1.0 = default)
+	lastModTime    time.Time   // for auto-reload detection
+	cellWidth      float64     // cached cell width in pixels
+	cellHeight     float64     // cached cell height in pixels
+	lastTermCols   int         // last known terminal columns (for change detection)
+	lastTermRows   int         // last known terminal rows (for change detection)
+	fifoPath       string      // path to FIFO for external page jump commands
+	skipClear      bool        // skip screen clear on next display (for smooth reload)
+	htmlPageWidth  int         // virtual page width in points for HTML layout (wider = smaller text)
+	isReflowable   bool        // true for HTML (supports layout adjustment)
+	darkMode       string      // "": off, "smart": HSL invert, "invert": simple RGB invert
+	dualPageMode   string      // "": off, "vertical": stacked, "horizontal": side-by-side, "half": half-page
+	halfPageOffset int         // 0: top half, 1: bottom half (used when dualPageMode == "half")
+	cropTop        float64     // fraction to cut from top edge (0.0–0.45)
+	cropBottom     float64     // fraction to cut from bottom edge
+	cropLeft       float64     // fraction to cut from left edge
+	cropRight      float64     // fraction to cut from right edge
 	isImage        bool        // true for standalone image files (PNG, JPG)
 	sourceImage    image.Image // loaded image for standalone image viewing
 
@@ -320,6 +321,16 @@ func (d *DocumentViewer) Run() bool {
 		return false
 	}
 	defer d.restoreTerminal(oldState)
+
+	// Silence MuPDF's stderr for the whole session. go-fitz wraps MuPDF, whose C
+	// code writes PDF parser warnings ("syntax error", "N 0 R", "object in xref")
+	// straight to fd 2 when it reads a damaged or partially written file — e.g. a
+	// PDF being rewritten by pdflatex. Those bytes bypass our synchronized-update
+	// frame and scatter across the terminal. Nothing here uses stderr for real
+	// output, so we redirect it once and restore on exit (see silenceStderr).
+	savedStderr, devNull := silenceStderr()
+	defer restoreStderr(savedStderr, devNull)
+
 	fmt.Print("\033[?25l")
 	defer fmt.Print("\033[?25h") // Show cursor on exit
 	// Force normal cursor-key mode (DECCKM reset) so arrows send ESC [ A-D rather
@@ -483,98 +494,125 @@ func (d *DocumentViewer) checkAndReload() bool {
 		return false
 	}
 
-	if info.ModTime().After(d.lastModTime) {
-		// Update lastModTime immediately to avoid repeated attempts
-		d.lastModTime = info.ModTime()
+	if !info.ModTime().After(d.lastModTime) {
+		return false
+	}
 
-		// Wait for file to stabilize (not still being written)
-		lastSize := info.Size()
-		for i := 0; i < 5; i++ {
-			time.Sleep(100 * time.Millisecond)
-			newInfo, err := os.Stat(d.path)
-			if err != nil {
-				return false
-			}
-			if newInfo.Size() == lastSize && newInfo.Size() > 0 {
-				break
-			}
-			lastSize = newInfo.Size()
-		}
-
-		if d.isImage {
-			f, err := os.Open(d.path)
-			if err != nil {
-				return false
-			}
-			defer f.Close()
-			img, _, err := image.Decode(f)
-			if err != nil {
-				return false
-			}
-			d.sourceImage = img
-			d.skipClear = true
-			return true
-		}
-
-		// Suppress stderr during document open
-		savedPage := d.currentPage
-		savedStderr, _ := syscall.Dup(2)
-		devNull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-		if devNull != nil && savedStderr != -1 {
-			syscall.Dup2(int(devNull.Fd()), 2)
-		}
-
-		doc, openErr := fitz.New(d.path)
-
-		// Restore stderr
-		if savedStderr != -1 {
-			syscall.Dup2(savedStderr, 2)
-			syscall.Close(savedStderr)
-		}
-		if devNull != nil {
-			devNull.Close()
-		}
-
-		if openErr != nil {
+	// File changed. Wait briefly for the size to stop changing, which catches the
+	// common case of statting the file mid-write.
+	lastSize := info.Size()
+	for i := 0; i < 5; i++ {
+		time.Sleep(100 * time.Millisecond)
+		newInfo, err := os.Stat(d.path)
+		if err != nil {
 			return false
 		}
-
-		// Check if new doc has valid pages before switching
-		oldDoc := d.doc
-		oldPages := d.textPages
-		oldPage := d.currentPage
-
-		d.doc = doc
-		if d.isReflowable {
-			d.applyHTMLLayout()
-		} else {
-			d.findContentPages()
+		info = newInfo
+		if newInfo.Size() == lastSize && newInfo.Size() > 0 {
+			break
 		}
+		lastSize = newInfo.Size()
+	}
 
-		if len(d.textPages) == 0 {
-			// New doc is invalid/corrupted, keep old one
-			d.doc = oldDoc
-			d.textPages = oldPages
-			d.currentPage = oldPage
-			doc.Close()
+	// For PDFs, only reload once the file is completely written, detected by a
+	// trailing %%EOF marker. pdflatex truncates and rewrites the PDF on every
+	// build; opening it mid-write makes MuPDF emit parser warnings and render a
+	// garbled or failed page. While the file is incomplete we keep the current
+	// page on screen and, crucially, do NOT advance lastModTime — so the pending
+	// change is re-detected and retried on a later tick.
+	if !d.isImage && d.fileType == "pdf" && !pdfLooksComplete(d.path) {
+		return false
+	}
+
+	d.lastModTime = info.ModTime()
+
+	if d.isImage {
+		f, err := os.Open(d.path)
+		if err != nil {
 			return false
 		}
-
-		// New doc is good, close old one
-		oldDoc.Close()
-
-		// Restore page position (clamp to valid range)
-		if savedPage >= len(d.textPages) {
-			savedPage = len(d.textPages) - 1
+		defer f.Close()
+		img, _, err := image.Decode(f)
+		if err != nil {
+			return false
 		}
-		if savedPage < 0 {
-			savedPage = 0
-		}
-		d.currentPage = savedPage
-		d.skipClear = true // Skip screen clear to avoid blink on reload
+		d.sourceImage = img
+		d.skipClear = true
 		return true
 	}
-	return false
+
+	savedPage := d.currentPage
+
+	// stderr is silenced for the whole interactive session (see silenceStderr in
+	// Run), so even an imperfect file can't leak MuPDF warnings onto the screen.
+	doc, openErr := fitz.New(d.path)
+	if openErr != nil {
+		return false
+	}
+
+	// Check that the new doc has valid pages before switching to it.
+	oldDoc := d.doc
+	oldPages := d.textPages
+	oldPage := d.currentPage
+
+	d.doc = doc
+	if d.isReflowable {
+		d.applyHTMLLayout()
+	} else {
+		d.findContentPages()
+	}
+
+	if len(d.textPages) == 0 {
+		// New doc is invalid/corrupted - keep the old one and the page on screen.
+		d.doc = oldDoc
+		d.textPages = oldPages
+		d.currentPage = oldPage
+		doc.Close()
+		return false
+	}
+
+	// New doc is good, close the old one.
+	oldDoc.Close()
+
+	// Restore page position (clamp to valid range).
+	if savedPage >= len(d.textPages) {
+		savedPage = len(d.textPages) - 1
+	}
+	if savedPage < 0 {
+		savedPage = 0
+	}
+	d.currentPage = savedPage
+	d.skipClear = true // Skip screen clear to avoid blink on reload
+	return true
+}
+
+// pdfLooksComplete reports whether the file appears to be a fully written PDF,
+// i.e. its tail contains the %%EOF end-of-file marker. PDF writers (pdflatex
+// included) emit %%EOF only after the whole file is flushed, so its absence
+// means the file is still being written.
+func pdfLooksComplete(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+
+	const tailLen = 2048
+	size := info.Size()
+	start := size - tailLen
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return false
+	}
+	return bytes.Contains(buf, []byte("%%EOF"))
 }
 
 // handleInput returns: 0 = continue, 1 = quit, -1 = search, -2 = goto page
@@ -752,7 +790,7 @@ func (d *DocumentViewer) startSearch(inputChan <-chan byte) {
 	}
 	_, rows := d.getTerminalSize()
 	fmt.Printf("\033[%d;1H\033[K", rows) // bottom line
-	fmt.Print("\033[?25h")                // show cursor
+	fmt.Print("\033[?25h")               // show cursor
 	fmt.Print("Search: ")
 
 	var query []byte
@@ -851,7 +889,6 @@ func (d *DocumentViewer) toggleViewMode() {
 		d.forceMode = ""
 	}
 }
-
 
 func (d *DocumentViewer) goToPage(inputChan <-chan byte) {
 	_, rows := d.getTerminalSize()

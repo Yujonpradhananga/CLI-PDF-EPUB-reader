@@ -236,6 +236,47 @@ func (d *DocumentViewer) getKittyCellSize() (float64, float64) {
 	return 0, 0
 }
 
+// silenceStderr redirects the process's standard error (fd 2) to /dev/null for
+// the whole interactive session and returns a duplicate of the original fd plus
+// the opened /dev/null handle so restoreStderr can put it back. go-fitz wraps
+// MuPDF, whose C code writes PDF parser warnings ("syntax error", "N 0 R",
+// "object in xref", ...) straight to fd 2 whenever it reads a damaged or
+// partially written file — e.g. a PDF being rewritten by pdflatex. Those bytes
+// bypass our synchronized-update frame and scatter across the screen. Nothing in
+// this program writes anything meaningful to stderr, so silencing it for the
+// session is safe; a panic in the main goroutine still shows its trace because
+// restoreStderr runs as a deferred call before the runtime prints it. Returns
+// (-1, nil) if redirection could not be set up, in which case restoreStderr is a
+// no-op.
+func silenceStderr() (int, *os.File) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return -1, nil
+	}
+	saved, err := syscall.Dup(2)
+	if err != nil {
+		devNull.Close()
+		return -1, nil
+	}
+	if err := syscall.Dup2(int(devNull.Fd()), 2); err != nil {
+		syscall.Close(saved)
+		devNull.Close()
+		return -1, nil
+	}
+	return saved, devNull
+}
+
+// restoreStderr reverses silenceStderr, reinstating the original fd 2.
+func restoreStderr(saved int, devNull *os.File) {
+	if saved >= 0 {
+		syscall.Dup2(saved, 2)
+		syscall.Close(saved)
+	}
+	if devNull != nil {
+		devNull.Close()
+	}
+}
+
 func (d *DocumentViewer) setRawMode() (*term.State, error) {
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
