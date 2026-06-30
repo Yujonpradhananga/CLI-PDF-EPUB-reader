@@ -258,50 +258,60 @@ func (d *DocumentViewer) readSingleChar() byte {
 		return 0
 	}
 
-	// Handle escape sequences (arrow keys, shift+arrow)
-	// Read bytes one at a time to avoid partial reads dropping sequence bytes
+	// Escape sequence handling. Arrow/function keys arrive in several shapes
+	// depending on terminal and mode: CSI (ESC [ ... final), SS3 (ESC O final),
+	// and with modifier params (ESC [ 1 ; 2 C). agterm/ghostty can use any of
+	// these. The key robustness rule: once we see an escape sequence we consume
+	// it WHOLE (up to its final byte 0x40-0x7E) and either map it to a known key
+	// or swallow it. We must never let leftover bytes ('[', ']', 'C', 'D', ...)
+	// flow back as commands, because those are destructive (crop / dark mode).
 	if buf[0] == 27 {
 		b := make([]byte, 1)
 		n, _ = os.Stdin.Read(b)
-		if n == 1 && b[0] == '[' {
-			n, _ = os.Stdin.Read(b)
-			if n == 1 {
-				switch b[0] {
-				case 'A': // Up arrow -> previous page (like k)
-					return 'k'
-				case 'B': // Down arrow -> next page (like j)
-					return 'j'
-				case 'C': // Right arrow -> next page
-					return 'j'
-				case 'D': // Left arrow -> previous page
-					return 'k'
-				case '1':
-					// Could be shift+arrow: ESC [ 1 ; 2 A/B/C/D
-					seq := make([]byte, 3)
-					n2 := 0
-					for i := 0; i < 3; i++ {
-						nn, _ := os.Stdin.Read(seq[i : i+1])
-						if nn == 0 {
-							break
-						}
-						n2++
-					}
-					if n2 == 3 && seq[0] == ';' && seq[1] == '2' {
-						switch seq[2] {
-						case 'A': // Shift+Up
-							return 'K' // uppercase = shift
-						case 'B': // Shift+Down
-							return 'J' // uppercase = shift
-						case 'C': // Shift+Right
-							return 'J' // uppercase = shift (forward)
-						case 'D': // Shift+Left
-							return 'K' // uppercase = shift (backward)
-						}
-					}
-				}
+		if n != 1 {
+			return 27 // bare ESC
+		}
+		if b[0] != '[' && b[0] != 'O' {
+			return 27 // ESC + something else; don't leak it as a crop/dark command
+		}
+
+		// Collect parameter/intermediate bytes until the final byte.
+		var params []byte
+		var final byte
+		for i := 0; i < 32; i++ {
+			if n, _ = os.Stdin.Read(b); n != 1 {
+				break
+			}
+			if b[0] >= 0x40 && b[0] <= 0x7E { // final byte
+				final = b[0]
+				break
+			}
+			params = append(params, b[0])
+		}
+
+		// Shift modifier shows up as a ";2" parameter (e.g. ESC [ 1 ; 2 C).
+		shift := false
+		for i := 0; i+1 < len(params); i++ {
+			if params[i] == ';' && params[i+1] == '2' {
+				shift = true
+				break
 			}
 		}
-		return 27 // Plain ESC
+
+		switch final {
+		case 'A', 'D': // Up / Left -> previous page
+			if shift {
+				return 'K'
+			}
+			return 'k'
+		case 'B', 'C': // Down / Right -> next page
+			if shift {
+				return 'J'
+			}
+			return 'j'
+		}
+		// Recognized escape sequence but not an arrow: swallow it entirely.
+		return 0
 	}
 
 	return buf[0]

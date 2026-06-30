@@ -322,6 +322,9 @@ func (d *DocumentViewer) Run() bool {
 	defer d.restoreTerminal(oldState)
 	fmt.Print("\033[?25l")
 	defer fmt.Print("\033[?25h") // Show cursor on exit
+	// Force normal cursor-key mode (DECCKM reset) so arrows send ESC [ A-D rather
+	// than the SS3 ESC O A-D form that some terminals (e.g. agterm) default to.
+	fmt.Print("\033[?1l")
 
 	d.currentPage = 0
 
