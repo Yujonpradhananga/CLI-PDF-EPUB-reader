@@ -13,6 +13,11 @@ import (
 	"github.com/blacktop/go-termimg"
 )
 
+// fastPNG encodes rendered pages with the fastest compression. These PNGs are
+// short-lived local temp files handed straight to the terminal, so encode speed
+// matters far more than file size (BestSpeed is ~3-5x faster than default).
+var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
+
 // cropImage trims fractions of each edge from an image.
 // Uses SubImage (zero-copy) when the image type supports it.
 func cropImage(img image.Image, top, bottom, left, right float64) image.Image {
@@ -49,11 +54,12 @@ func (d *DocumentViewer) renderPageImageAligned(pageNum, maxWidth, maxHeight int
 	}
 
 	termType := d.detectTerminalType()
-	imagePath, actualHeight, imageWidthInChars, actualPixelWidth, actualPixelHeight, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType)
+	rp := d.snapshotParams() // main thread: safe to read viewer state
+	imagePath, actualHeight, imageWidthInChars, actualPixelWidth, actualPixelHeight, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType, rp)
 	if err != nil {
 		return 0
 	}
-	defer os.Remove(imagePath)
+	// Note: imagePath is owned by the render cache (evicted later); do not delete here.
 
 	var horizontalOffset int
 	switch align {
@@ -97,12 +103,18 @@ func scaleImage(src image.Image, targetW, targetH int) image.Image {
 	return dst
 }
 
-func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string) (string, int, int, int, int, error) {
+func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string, rp renderParams) (string, int, int, int, int, error) {
 	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
 		return "", 0, 0, 0, 0, err
 	}
 
-	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
+	// Serve from the render cache when nothing affecting the output changed.
+	sig := renderSig(pageNum, termWidth, termHeight, termType, rp)
+	if c, ok := d.cacheGet(sig); ok {
+		return c.path, c.lines, c.widthChars, c.pxW, c.pxH, nil
+	}
+
+	pixelsPerChar, pixelsPerLine := rp.pixelsPerChar, rp.pixelsPerLine
 
 	// Supersample for the kitty graphics protocol (kitty / ghostty / agterm). agterm and
 	// ghostty report logical (1x) pixels via TIOCGWINSZ, so a page rendered to match that
@@ -121,7 +133,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	effectiveHeight := termHeight - verticalPadding
 
 	// Apply user scale factor
-	scale := d.scaleFactor
+	scale := rp.scaleFactor
 	if scale == 0 {
 		scale = 1.0
 	}
@@ -137,20 +149,23 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		srcBounds := d.sourceImage.Bounds()
 		aspectRatio = float64(srcBounds.Dy()) / float64(srcBounds.Dx())
 	} else {
-		// Get page dimensions at 72 DPI to calculate proper render DPI
-		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		// Page box in points == pixels at 72 DPI. Bound() just queries geometry;
+		// it avoids a full throwaway render of the page on every switch.
+		r, err := d.doc.Bound(pageNum)
 		if err != nil {
 			return "", 0, 0, 0, 0, err
 		}
-		testBounds := testImg.Bounds()
-		pageWidthAt72 = testBounds.Dx()
-		pageHeightAt72 = testBounds.Dy()
+		pageWidthAt72 = r.Dx()
+		pageHeightAt72 = r.Dy()
+		if pageWidthAt72 <= 0 || pageHeightAt72 <= 0 {
+			return "", 0, 0, 0, 0, fmt.Errorf("invalid page bounds for page %d", pageNum)
+		}
 		aspectRatio = float64(pageHeightAt72) / float64(pageWidthAt72)
 	}
 
 	// Calculate final dimensions based on fit mode
 	var finalWidth, finalHeight int
-	switch d.fitMode {
+	switch rp.fitMode {
 	case "height":
 		finalHeight = targetPixelHeight
 		finalWidth = int(float64(finalHeight) / aspectRatio)
@@ -207,7 +222,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 
 	// Apply dark mode
 	var finalImg image.Image = img
-	switch d.darkMode {
+	switch rp.darkMode {
 	case "smart":
 		finalImg = smartInvert(img)
 	case "invert":
@@ -215,7 +230,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	}
 
 	// Apply user crop
-	finalImg = cropImage(finalImg, d.cropTop, d.cropBottom, d.cropLeft, d.cropRight)
+	finalImg = cropImage(finalImg, rp.cropTop, rp.cropBottom, rp.cropLeft, rp.cropRight)
 
 	bounds := finalImg.Bounds()
 	actualWidth := bounds.Dx()
@@ -230,20 +245,28 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 
 	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar/superSample) + 1
 
-	filename := fmt.Sprintf("page_%d.png", pageNum)
-	imagePath := filepath.Join(d.tempDir, filename)
+	// Per-signature filename so cached/prefetched pages don't clobber each other.
+	imagePath := d.cachePath(sig)
 
 	file, err := os.Create(imagePath)
 	if err != nil {
 		return "", 0, 0, 0, 0, err
 	}
-	defer file.Close()
 
-	err = png.Encode(file, finalImg)
-	if err != nil {
+	if err = fastPNG.Encode(file, finalImg); err != nil {
+		file.Close()
 		os.Remove(imagePath)
 		return "", 0, 0, 0, 0, err
 	}
+	file.Close()
+
+	d.cacheStore(sig, cachedRender{
+		path:       imagePath,
+		lines:      actualLines,
+		widthChars: imageWidthInChars,
+		pxW:        actualWidth,
+		pxH:        actualHeight,
+	})
 
 	return imagePath, actualLines, imageWidthInChars, actualWidth, actualHeight, nil
 }
@@ -272,13 +295,16 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		srcBounds := d.sourceImage.Bounds()
 		aspectRatio = float64(srcBounds.Dy()) / float64(srcBounds.Dx())
 	} else {
-		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		// Page box in points == pixels at 72 DPI; avoids a throwaway full render.
+		r, err := d.doc.Bound(pageNum)
 		if err != nil {
 			return nil, err
 		}
-		testBounds := testImg.Bounds()
-		pageWidthAt72 = testBounds.Dx()
-		pageHeightAt72 = testBounds.Dy()
+		pageWidthAt72 = r.Dx()
+		pageHeightAt72 = r.Dy()
+		if pageWidthAt72 <= 0 || pageHeightAt72 <= 0 {
+			return nil, fmt.Errorf("invalid page bounds for page %d", pageNum)
+		}
 		aspectRatio = float64(pageHeightAt72) / float64(pageWidthAt72)
 	}
 
@@ -459,7 +485,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 	if err != nil {
 		return 0
 	}
-	if err := png.Encode(file, composite); err != nil {
+	if err := fastPNG.Encode(file, composite); err != nil {
 		file.Close()
 		os.Remove(imagePath)
 		return 0
@@ -598,7 +624,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	if err != nil {
 		return 0
 	}
-	if err := png.Encode(file, croppedImg); err != nil {
+	if err := fastPNG.Encode(file, croppedImg); err != nil {
 		file.Close()
 		os.Remove(imagePath)
 		return 0

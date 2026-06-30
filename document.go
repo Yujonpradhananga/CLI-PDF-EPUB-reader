@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,6 +52,15 @@ type DocumentViewer struct {
 	cropRight      float64 // fraction to cut from right edge
 	isImage        bool        // true for standalone image files (PNG, JPG)
 	sourceImage    image.Image // loaded image for standalone image viewing
+
+	// Rendered-page cache (single-page image path): maps a render signature to an
+	// on-disk PNG so revisiting a page is instant, and a background goroutine can
+	// prefetch neighbors. go-fitz is internally mutex-locked, so concurrent renders
+	// are safe; cacheMu only guards the maps below.
+	renderCache map[string]cachedRender
+	cacheOrder  []string        // insertion order for simple LRU eviction
+	inFlight    map[string]bool // signatures currently being prefetched
+	cacheMu     sync.Mutex
 }
 
 func NewDocumentViewer(path string) *DocumentViewer {
@@ -78,6 +88,8 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		cropRight:     cfg.CropRight,
 		isReflowable:  fileType == "html" || fileType == "htm",
 		isImage:       fileType == "png" || fileType == "jpg" || fileType == "jpeg",
+		renderCache:   make(map[string]cachedRender),
+		inFlight:      make(map[string]bool),
 	}
 
 	return dv

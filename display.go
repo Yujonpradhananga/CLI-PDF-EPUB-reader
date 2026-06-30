@@ -56,6 +56,12 @@ func (d *DocumentViewer) displayCurrentPage() {
 	}
 	fmt.Print("\033[9999;1H")
 
+	// Warm neighbor pages in the background so sequential reading is instant.
+	// Gated on the current page being an image (image-heavy docs like math PDFs).
+	if contentType == "image" {
+		d.prefetchNeighbors(termWidth, termHeight)
+	}
+
 	// End synchronized update - display everything at once
 	fmt.Print("\033[?2026l")
 	os.Stdout.Sync()
