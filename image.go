@@ -93,7 +93,7 @@ func scaleImage(src image.Image, targetW, targetH int) image.Image {
 		for x := 0; x < targetW; x++ {
 			srcX := bounds.Min.X + x*srcW/targetW
 			r, g, b, a := src.At(srcX, srcY).RGBA()
-			i := (y*dst.Stride) + x*4
+			i := (y * dst.Stride) + x*4
 			dst.Pix[i+0] = uint8(r >> 8)
 			dst.Pix[i+1] = uint8(g >> 8)
 			dst.Pix[i+2] = uint8(b >> 8)
@@ -674,6 +674,24 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 
 	if err != nil {
 		return 0
+	}
+
+	// Flicker-free swap (kitty): the new image was just placed over the old one, so
+	// now delete the PREVIOUS image by id. Drawing-then-deleting (rather than the
+	// old delete-all-then-draw) means a reload never blanks the screen while the new
+	// page transmits. d=I also frees the old image's data, so a long LaTeX session
+	// doesn't accumulate images in terminal memory.
+	if termType == "kitty" {
+		if r, rerr := img.GetRenderer(); rerr == nil {
+			if kr, ok := r.(*termimg.KittyRenderer); ok {
+				if newID := kr.GetLastImageID(); newID != 0 {
+					if d.lastKittyImageID != 0 && d.lastKittyImageID != newID {
+						fmt.Printf("\033_Ga=d,d=I,i=%d\033\\", d.lastKittyImageID)
+					}
+					d.lastKittyImageID = newID
+				}
+			}
+		}
 	}
 
 	return estimatedLines

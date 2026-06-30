@@ -15,9 +15,11 @@ func (d *DocumentViewer) displayCurrentPage() {
 	fmt.Print("\033[?2026h")
 
 	if d.skipClear {
-		// Reload case: delete Kitty images, move home, overwrite
-		fmt.Print("\033_Ga=d,d=A\033\\") // Delete all Kitty images
-		fmt.Print("\033[H")              // Move cursor home
+		// Reload case (LaTeX rebuild): do NOT clear or delete anything up front.
+		// Leave the current page on screen and draw the new page over it; the old
+		// image is deleted by id afterwards (see renderWithTermImg), so the screen
+		// never blanks while the new page transmits.
+		fmt.Print("\033[H") // Move cursor home
 		d.skipClear = false
 	} else {
 		// Normal case: full screen clear

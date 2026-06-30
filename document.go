@@ -54,6 +54,11 @@ type DocumentViewer struct {
 	isImage        bool        // true for standalone image files (PNG, JPG)
 	sourceImage    image.Image // loaded image for standalone image viewing
 
+	// lastKittyImageID is the kitty graphics image id currently on screen. The next
+	// render draws the new page first, then deletes this id — so a reload (LaTeX
+	// rebuild) never blanks the screen with a delete-all-then-redraw gap.
+	lastKittyImageID uint32
+
 	// Rendered-page cache (single-page image path): maps a render signature to an
 	// on-disk PNG so revisiting a page is instant, and a background goroutine can
 	// prefetch neighbors. go-fitz is internally mutex-locked, so concurrent renders
