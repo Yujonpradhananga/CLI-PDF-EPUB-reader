@@ -32,6 +32,10 @@ func (d *DocumentViewer) detectTerminalType() string {
 		switch termProgram {
 		case "WezTerm":
 			return "wezterm"
+		case "ghostty":
+			// Ghostty (and agterm, which embeds libghostty) implements the kitty
+			// graphics protocol; treat as kitty so it gets the 300-DPI render path.
+			return "kitty"
 		case "iTerm.app":
 			return "iterm2"
 		case "Apple_Terminal":
@@ -45,6 +49,8 @@ func (d *DocumentViewer) detectTerminalType() string {
 	switch {
 	case strings.Contains(term, "kitty"):
 		return "kitty"
+	case strings.Contains(term, "ghostty"):
+		return "kitty" // kitty graphics protocol; check before the "xterm" case
 	case strings.Contains(term, "foot"):
 		return "foot"
 	case strings.Contains(term, "alacritty"):

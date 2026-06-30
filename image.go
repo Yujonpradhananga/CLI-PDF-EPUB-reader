@@ -104,6 +104,16 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
+	// Supersample for the kitty graphics protocol (kitty / ghostty / agterm). agterm and
+	// ghostty report logical (1x) pixels via TIOCGWINSZ, so a page rendered to match that
+	// size is upscaled by the terminal on a retina display -> blurry. Render at 2x and keep
+	// the cell footprint logical (divide it back out below); the terminal scales the hi-res
+	// image into the same cells -> crisp. No dependence on DOCVIEWER_CELL_SIZE.
+	superSample := 1.0
+	if termType == "kitty" {
+		superSample = 2.0
+	}
+
 	// Calculate target pixel dimensions based on terminal size
 	horizontalPadding := 4
 	verticalPadding := 3
@@ -172,6 +182,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		if dpiForHeight < dpi {
 			dpi = dpiForHeight
 		}
+		dpi *= superSample // render hi-res; footprint stays logical (divided back out below)
 
 		// Clamp DPI to reasonable range
 		if dpi < 36 {
@@ -181,6 +192,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		if termType != "kitty" {
 			maxDPI = 100.0
 		}
+		maxDPI *= superSample
 		if dpi > maxDPI {
 			dpi = maxDPI
 		}
@@ -209,12 +221,14 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	actualWidth := bounds.Dx()
 	actualHeight := bounds.Dy()
 
-	actualLines := int(float64(actualHeight)/pixelsPerLine) + 1
+	// Divide the supersample factor back out so the cell footprint stays logical
+	// (the image has superSample x more pixels than its on-screen cell area).
+	actualLines := int(float64(actualHeight)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
 
-	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar/superSample) + 1
 
 	filename := fmt.Sprintf("page_%d.png", pageNum)
 	imagePath := filepath.Join(d.tempDir, filename)
