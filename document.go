@@ -59,6 +59,13 @@ type DocumentViewer struct {
 	// rebuild) never blanks the screen with a delete-all-then-redraw gap.
 	lastKittyImageID uint32
 
+	// Per-frame PNGs for the dual/half display paths (not covered by the render
+	// cache). Each frame gets a fresh file; the previous frame's file is deleted
+	// only after the next one is transmitted, because t=f transmission means the
+	// terminal reads the file asynchronously (see saveEphemeralPNG).
+	ephemeralSeq      int
+	lastEphemeralPath string
+
 	// Rendered-page cache (single-page image path): maps a render signature to an
 	// on-disk PNG so revisiting a page is instant, and a background goroutine can
 	// prefetch neighbors. go-fitz is internally mutex-locked, so concurrent renders
@@ -319,6 +326,10 @@ func (d *DocumentViewer) Run() bool {
 
 	// Cache cell size before entering raw mode (for Kitty query)
 	d.cellWidth, d.cellHeight = d.detectCellSize()
+
+	// Decide the kitty graphics transfer mode (t=f vs chunked direct) once, before
+	// the stdin-reading goroutine starts — the probe reads a reply from the tty.
+	d.probeKittyTransferMode()
 
 	oldState, err := d.setRawMode()
 	if err != nil {

@@ -44,6 +44,34 @@ func cropImage(img image.Image, top, bottom, left, right float64) image.Image {
 	return dst
 }
 
+// saveEphemeralPNG writes a per-frame PNG for the dual/half display paths and
+// deletes the previous frame's file. With t=f transmission the terminal opens
+// the file only when it processes the escape sequence, so the current frame's
+// file must outlive renderWithTermImg (no immediate delete); the previous
+// frame's file has certainly been consumed by then.
+func (d *DocumentViewer) saveEphemeralPNG(prefix string, img image.Image) (string, error) {
+	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
+		return "", err
+	}
+	d.ephemeralSeq++
+	imagePath := filepath.Join(d.tempDir, fmt.Sprintf("%s_%d.png", prefix, d.ephemeralSeq))
+	file, err := os.Create(imagePath)
+	if err != nil {
+		return "", err
+	}
+	if err := fastPNG.Encode(file, img); err != nil {
+		file.Close()
+		os.Remove(imagePath)
+		return "", err
+	}
+	file.Close()
+	if d.lastEphemeralPath != "" {
+		os.Remove(d.lastEphemeralPath)
+	}
+	d.lastEphemeralPath = imagePath
+	return imagePath, nil
+}
+
 func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 	return d.renderPageImageAligned(pageNum, maxWidth, maxHeight, "center")
 }
@@ -477,21 +505,10 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 	}
 
 	// Save composite
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return 0
-	}
-	imagePath := filepath.Join(d.tempDir, "dual.png")
-	file, err := os.Create(imagePath)
+	imagePath, err := d.saveEphemeralPNG("dual", composite)
 	if err != nil {
 		return 0
 	}
-	if err := fastPNG.Encode(file, composite); err != nil {
-		file.Close()
-		os.Remove(imagePath)
-		return 0
-	}
-	file.Close()
-	defer os.Remove(imagePath)
 
 	actualLines := int(float64(compositeH)/pixelsPerLine) + 1
 	if actualLines > termHeight {
@@ -616,21 +633,10 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	croppedImg = cropImage(croppedImg, userTop, userBottom, d.cropLeft, d.cropRight)
 
 	// Save
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return 0
-	}
-	imagePath := filepath.Join(d.tempDir, "half.png")
-	file, err := os.Create(imagePath)
+	imagePath, err := d.saveEphemeralPNG("half", croppedImg)
 	if err != nil {
 		return 0
 	}
-	if err := fastPNG.Encode(file, croppedImg); err != nil {
-		file.Close()
-		os.Remove(imagePath)
-		return 0
-	}
-	file.Close()
-	defer os.Remove(imagePath)
 
 	cb := croppedImg.Bounds()
 	finalW := cb.Dx()
@@ -655,45 +661,34 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 		fmt.Printf("\033[%dC", horizontalOffset) // Move cursor right
 	}
 
-	// Use termimg fluent API to control size in terminal cells
+	// Kitty path: hand the terminal the PNG already on disk (see kitty.go) instead
+	// of going through termimg, which decodes the PNG and retransmits it as raw
+	// RGBA base64 — tens of MB through the PTY per page display in agterm/ghostty.
+	if termType == "kitty" {
+		newID := nextKittyImageID()
+		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines); err != nil {
+			return 0
+		}
+		// Flicker-free swap: the new image was just placed over the old one, so
+		// now delete the PREVIOUS image by id. Drawing-then-deleting (rather than
+		// the old delete-all-then-draw) means a reload never blanks the screen
+		// while the new page transmits. d=I also frees the old image's data, so a
+		// long LaTeX session doesn't accumulate images in terminal memory.
+		if d.lastKittyImageID != 0 && d.lastKittyImageID != newID {
+			fmt.Printf("\033_Ga=d,d=I,i=%d\033\\", d.lastKittyImageID)
+		}
+		d.lastKittyImageID = newID
+		return estimatedLines
+	}
+
+	// Sixel terminals (Foot, xterm, etc.): pixel-based dimensions with ScaleFit
 	img, err := termimg.Open(imagePath)
 	if err != nil {
 		return 0
 	}
-
-	// Choose rendering strategy based on terminal type:
-	// - Kitty uses native graphics protocol with character-based dimensions
-	// - Sixel terminals need pixel-based dimensions for proper scaling
-	if termType == "kitty" {
-		// Kitty: use character-based dimensions with ScaleNone
-		err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
-	} else {
-		// Sixel terminals (Foot, xterm, etc.): use pixel-based dimensions with ScaleFit
-		err = img.WidthPixels(pixelWidth).HeightPixels(pixelHeight).Scale(termimg.ScaleFit).Print()
-	}
-
-	if err != nil {
+	if err := img.WidthPixels(pixelWidth).HeightPixels(pixelHeight).Scale(termimg.ScaleFit).Print(); err != nil {
 		return 0
 	}
-
-	// Flicker-free swap (kitty): the new image was just placed over the old one, so
-	// now delete the PREVIOUS image by id. Drawing-then-deleting (rather than the
-	// old delete-all-then-draw) means a reload never blanks the screen while the new
-	// page transmits. d=I also frees the old image's data, so a long LaTeX session
-	// doesn't accumulate images in terminal memory.
-	if termType == "kitty" {
-		if r, rerr := img.GetRenderer(); rerr == nil {
-			if kr, ok := r.(*termimg.KittyRenderer); ok {
-				if newID := kr.GetLastImageID(); newID != 0 {
-					if d.lastKittyImageID != 0 && d.lastKittyImageID != newID {
-						fmt.Printf("\033_Ga=d,d=I,i=%d\033\\", d.lastKittyImageID)
-					}
-					d.lastKittyImageID = newID
-				}
-			}
-		}
-	}
-
 	return estimatedLines
 }
 

@@ -601,6 +601,11 @@ func (d *DocumentViewer) showDebugInfo(inputChan <-chan byte) {
 	p(fmt.Sprintf("Calculated terminal pixels: %.0f x %.0f", float64(cols)*cellW, float64(rows)*cellH))
 	p(fmt.Sprintf("Fit mode: %s", d.fitMode))
 	p(fmt.Sprintf("Scale factor: %.1f", d.scaleFactor))
+	xfer := "direct (chunked PNG)"
+	if kittyXferMode == kittyXferFile {
+		xfer = "file (t=f)"
+	}
+	p(fmt.Sprintf("Kitty transfer mode: %s", xfer))
 	p("")
 	p("Press any key to return...")
 	<-inputChan
