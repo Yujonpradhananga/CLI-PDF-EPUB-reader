@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 )
 
 // cachedRender is a fully-rendered single page on disk plus the geometry the
@@ -57,47 +61,159 @@ func (d *DocumentViewer) snapshotParams() renderParams {
 	}
 }
 
-// maxCachedPages caps the on-disk render cache. Each entry is one PNG in tempDir;
-// they are removed on eviction and the whole tempDir is cleaned up on quit.
-const maxCachedPages = 12
+// maxCachedPages caps the in-memory render index. Evicted entries only drop the
+// map entry; the PNG stays in the persistent cache dir, owned by the GC below.
+const maxCachedPages = 48
+
+// maxPersistentCached caps the cross-session render cache (newest-by-mtime
+// survive; cache hits touch the file, giving approximate LRU).
+const maxPersistentCached = 200
+
+// persistentCacheDir returns the cross-session render cache directory
+// (~/Library/Caches/docviewer on macOS), or "" if it can't be created.
+func persistentCacheDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(base, "docviewer")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	return dir
+}
 
 // renderSig is a cache key covering everything that changes a rendered page.
 // If any of these differ, the cached image is stale and must be re-rendered.
-// rp.lastMod busts the cache on auto-reload.
+// rp.lastMod busts the cache on auto-reload. Cell pixel size matters for the
+// persistent cache: across sessions the same cols x rows can be a different
+// monitor/font, i.e. different pixel dimensions.
 func renderSig(pageNum, termWidth, termHeight int, termType string, rp renderParams) string {
-	return fmt.Sprintf("p%d|w%d|h%d|t%s|f%s|s%.3f|d%s|dp%s|ho%d|c%.4f,%.4f,%.4f,%.4f|hw%d|m%d",
+	return fmt.Sprintf("p%d|w%d|h%d|t%s|f%s|s%.3f|d%s|dp%s|ho%d|c%.4f,%.4f,%.4f,%.4f|hw%d|m%d|px%.2fx%.2f",
 		pageNum, termWidth, termHeight, termType, rp.fitMode, rp.scaleFactor, rp.darkMode,
 		rp.dualPageMode, rp.halfPageOffset, rp.cropTop, rp.cropBottom, rp.cropLeft, rp.cropRight,
-		rp.htmlPageWidth, rp.lastMod)
+		rp.htmlPageWidth, rp.lastMod, rp.pixelsPerChar, rp.pixelsPerLine)
 }
 
-// cachePath returns a stable per-signature filename in tempDir.
+// cachePath returns a stable filename in the persistent cache dir, keyed by
+// the document's absolute path plus the render signature (the signature alone
+// isn't unique across documents once the cache dir is shared).
 func (d *DocumentViewer) cachePath(sig string) string {
+	absPath, _ := filepath.Abs(d.path)
 	h := fnv.New64a()
+	_, _ = h.Write([]byte(absPath))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(sig))
-	return fmt.Sprintf("%s/cache_%016x.png", d.tempDir, h.Sum64())
+	return filepath.Join(d.cacheDir, fmt.Sprintf("cache_%016x.png", h.Sum64()))
 }
 
-// cacheGet returns a cached render if present and its file still exists.
+// writeMeta persists the placement geometry next to a cached PNG so a later
+// session can reuse the render without re-deriving lines/cols/pixels.
+func writeMeta(pngPath string, c cachedRender) {
+	data := fmt.Sprintf("%d %d %d %d\n", c.lines, c.widthChars, c.pxW, c.pxH)
+	_ = os.WriteFile(pngPath+".meta", []byte(data), 0o644)
+}
+
+// readMeta loads the geometry sidecar for a cached PNG.
+func readMeta(pngPath string) (cachedRender, bool) {
+	data, err := os.ReadFile(pngPath + ".meta")
+	if err != nil {
+		return cachedRender{}, false
+	}
+	var c cachedRender
+	if _, err := fmt.Sscanf(string(data), "%d %d %d %d", &c.lines, &c.widthChars, &c.pxW, &c.pxH); err != nil {
+		return cachedRender{}, false
+	}
+	if c.lines <= 0 || c.widthChars <= 0 {
+		return cachedRender{}, false
+	}
+	c.path = pngPath
+	return c, true
+}
+
+// gcPersistentCache prunes the shared cache dir to the newest maxPersistentCached
+// PNGs and sweeps orphaned .meta and stale .tmp files. Run in a goroutine at
+// viewer startup; concurrent viewers at worst re-render a pruned page.
+func gcPersistentCache(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type pngFile struct {
+		path string
+		mod  time.Time
+	}
+	var pngs []pngFile
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "cache_") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		switch {
+		case strings.Contains(name, ".tmp"):
+			// Leftover from a crashed writer; the rename never happened.
+			if time.Since(info.ModTime()) > time.Hour {
+				os.Remove(full)
+			}
+		case strings.HasSuffix(name, ".png"):
+			pngs = append(pngs, pngFile{full, info.ModTime()})
+		case strings.HasSuffix(name, ".meta"):
+			if _, err := os.Stat(strings.TrimSuffix(full, ".meta")); err != nil {
+				os.Remove(full)
+			}
+		}
+	}
+	if len(pngs) <= maxPersistentCached {
+		return
+	}
+	sort.Slice(pngs, func(i, j int) bool { return pngs[i].mod.After(pngs[j].mod) })
+	for _, p := range pngs[maxPersistentCached:] {
+		os.Remove(p.path)
+		os.Remove(p.path + ".meta")
+	}
+}
+
+// cacheGet returns a cached render if present and its file still exists. On an
+// in-memory miss it falls back to the persistent cache dir, so reopening a
+// document (or re-toggling dark mode/zoom) reuses renders from past sessions.
 func (d *DocumentViewer) cacheGet(sig string) (cachedRender, bool) {
 	d.cacheMu.Lock()
 	c, ok := d.renderCache[sig]
 	d.cacheMu.Unlock()
-	if !ok {
-		return cachedRender{}, false
-	}
-	if _, err := os.Stat(c.path); err != nil {
-		// File vanished (e.g. tempDir cleaned) - drop the stale entry.
+	if ok {
+		if _, err := os.Stat(c.path); err == nil {
+			return c, true
+		}
+		// File vanished (e.g. GC pruned it) - drop the stale entry.
 		d.cacheMu.Lock()
 		delete(d.renderCache, sig)
 		d.cacheMu.Unlock()
 		return cachedRender{}, false
 	}
+
+	// Disk fallback: a previous session may have rendered this exact signature.
+	pngPath := d.cachePath(sig)
+	if _, err := os.Stat(pngPath); err != nil {
+		return cachedRender{}, false
+	}
+	c, ok = readMeta(pngPath)
+	if !ok {
+		return cachedRender{}, false
+	}
+	now := time.Now()
+	_ = os.Chtimes(pngPath, now, now) // LRU touch for gcPersistentCache
+	d.cacheStore(sig, c)
 	return c, true
 }
 
-// cacheStore records a render and evicts the oldest entries past the cap,
-// deleting their files.
+// cacheStore records a render and evicts the oldest map entries past the cap.
+// Eviction drops only the in-memory index; the PNG stays on disk for the
+// persistent cache (gcPersistentCache owns file deletion).
 func (d *DocumentViewer) cacheStore(sig string, c cachedRender) {
 	d.cacheMu.Lock()
 	defer d.cacheMu.Unlock()
@@ -108,10 +224,7 @@ func (d *DocumentViewer) cacheStore(sig string, c cachedRender) {
 	for len(d.cacheOrder) > maxCachedPages {
 		oldest := d.cacheOrder[0]
 		d.cacheOrder = d.cacheOrder[1:]
-		if old, ok := d.renderCache[oldest]; ok {
-			os.Remove(old.path)
-			delete(d.renderCache, oldest)
-		}
+		delete(d.renderCache, oldest)
 	}
 }
 
@@ -129,7 +242,9 @@ func (d *DocumentViewer) prefetchNeighbors(termWidth, termHeight int) {
 	}
 	rp := d.snapshotParams() // snapshot on the main thread
 	termType := d.detectTerminalType()
-	for _, delta := range []int{1, -1} {
+	// Nearest pages first: goroutines contend on go-fitz's internal lock, so
+	// spawn order roughly determines render order.
+	for _, delta := range []int{1, -1, 2, -2, 3, -3} {
 		idx := d.currentPage + delta
 		if idx < 0 || idx >= len(d.textPages) {
 			continue

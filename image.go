@@ -132,7 +132,7 @@ func scaleImage(src image.Image, targetW, targetH int) image.Image {
 }
 
 func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string, rp renderParams) (string, int, int, int, int, error) {
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
+	if err := os.MkdirAll(d.cacheDir, 0o755); err != nil {
 		return "", 0, 0, 0, 0, err
 	}
 
@@ -273,28 +273,40 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 
 	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar/superSample) + 1
 
-	// Per-signature filename so cached/prefetched pages don't clobber each other.
+	// Per-signature filename in the shared persistent cache dir. Write via
+	// tmp+rename so a concurrent viewer process rendering the same signature
+	// can't interleave writes into a torn PNG.
 	imagePath := d.cachePath(sig)
+	tmpPath := fmt.Sprintf("%s.tmp%d", imagePath, os.Getpid())
 
-	file, err := os.Create(imagePath)
+	file, err := os.Create(tmpPath)
 	if err != nil {
 		return "", 0, 0, 0, 0, err
 	}
 
 	if err = fastPNG.Encode(file, finalImg); err != nil {
 		file.Close()
-		os.Remove(imagePath)
+		os.Remove(tmpPath)
 		return "", 0, 0, 0, 0, err
 	}
 	file.Close()
 
-	d.cacheStore(sig, cachedRender{
+	c := cachedRender{
 		path:       imagePath,
 		lines:      actualLines,
 		widthChars: imageWidthInChars,
 		pxW:        actualWidth,
 		pxH:        actualHeight,
-	})
+	}
+	// Meta before rename: readers require the PNG to exist first, so a sidecar
+	// without its PNG is just a miss (and swept by the GC), never a bad read.
+	writeMeta(imagePath, c)
+	if err := os.Rename(tmpPath, imagePath); err != nil {
+		os.Remove(tmpPath)
+		return "", 0, 0, 0, 0, err
+	}
+
+	d.cacheStore(sig, c)
 
 	return imagePath, actualLines, imageWidthInChars, actualWidth, actualHeight, nil
 }
@@ -559,11 +571,15 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		}
 	} else {
 		// Compute DPI so that 55% of the page height fills termHeight exactly.
-		testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+		// Page box in points == pixels at 72 DPI; avoids a throwaway full render.
+		r, err := d.doc.Bound(pageNum)
 		if err != nil {
 			return 0
 		}
-		pageHeightAt72 := testImg.Bounds().Dy()
+		pageHeightAt72 := r.Dy()
+		if pageHeightAt72 <= 0 {
+			return 0
+		}
 
 		targetCropPixels := float64(termHeight) * pixelsPerLine
 		targetFullPixels := targetCropPixels / 0.55
@@ -692,55 +708,67 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 	return estimatedLines
 }
 
+// toRGBACopy returns a fresh *image.RGBA copy of src with zero-origin bounds.
+// Always copies: the invert functions mutate the returned pixels in place, and
+// src may be a shared image (d.sourceImage) that must stay pristine.
+func toRGBACopy(src image.Image) *image.RGBA {
+	b := src.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
+	return dst
+}
+
 // smartInvert inverts lightness while preserving hue and saturation.
 // White backgrounds become black, black text becomes white, colors keep their hue.
+// Grayscale pixels (r==g==b — virtually all of a rendered PDF page) go through a
+// 256-entry LUT; only colored pixels pay the float HSL round trip. Direct Pix
+// access instead of At()/Set() keeps this fast on ~12 MP supersampled pages.
 func smartInvert(src image.Image) image.Image {
-	bounds := src.Bounds()
-	dst := image.NewRGBA(bounds)
+	rgba := toRGBACopy(src)
 
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, a := src.At(x, y).RGBA()
-			r8 := float64(r>>8) / 255.0
-			g8 := float64(g>>8) / 255.0
-			b8 := float64(b>>8) / 255.0
-
-			h, s, l := rgbToHSL(r8, g8, b8)
-			l = 0.12 + (1.0-l)*0.88 // invert lightness; dark gray bg instead of pure black
-			nr, ng, nb := hslToRGB(h, s, l)
-
-			dst.Set(x, y, color.RGBA{
-				R: uint8(nr * 255),
-				G: uint8(ng * 255),
-				B: uint8(nb * 255),
-				A: uint8(a >> 8),
-			})
-		}
+	// LUT for the grayscale case: s=0, so hslToRGB returns (l,l,l) with
+	// l' = 0.12 + (1-l)*0.88 (dark gray bg instead of pure black).
+	var lut [256]uint8
+	for v := 0; v < 256; v++ {
+		l := 0.12 + (1.0-float64(v)/255.0)*0.88
+		lut[v] = uint8(l * 255)
 	}
-	return dst
+
+	pix := rgba.Pix
+	for i := 0; i < len(pix); i += 4 {
+		r, g, b := pix[i], pix[i+1], pix[i+2]
+		if r == g && g == b {
+			v := lut[r]
+			pix[i], pix[i+1], pix[i+2] = v, v, v
+			continue
+		}
+		h, s, l := rgbToHSL(float64(r)/255.0, float64(g)/255.0, float64(b)/255.0)
+		l = 0.12 + (1.0-l)*0.88
+		nr, ng, nb := hslToRGB(h, s, l)
+		pix[i] = uint8(nr * 255)
+		pix[i+1] = uint8(ng * 255)
+		pix[i+2] = uint8(nb * 255)
+	}
+	return rgba
 }
 
 // simpleInvert does a full RGB color inversion with the same gray background shift.
 func simpleInvert(src image.Image) image.Image {
-	bounds := src.Bounds()
-	dst := image.NewRGBA(bounds)
+	rgba := toRGBACopy(src)
 
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, a := src.At(x, y).RGBA()
-			// Invert and remap to gray bg range: 255→30, 0→255
-			nr := 30 + (255-r>>8)*225/255
-			ng := 30 + (255-g>>8)*225/255
-			nb := 30 + (255-b>>8)*225/255
-			dst.Set(x, y, color.RGBA{
-				R: uint8(nr),
-				G: uint8(ng),
-				B: uint8(nb),
-				A: uint8(a >> 8),
-			})
-		}
+	// Invert and remap to gray bg range: 255→30, 0→255
+	var lut [256]uint8
+	for v := 0; v < 256; v++ {
+		lut[v] = uint8(30 + (255-v)*225/255)
 	}
-	return dst
+
+	pix := rgba.Pix
+	for i := 0; i < len(pix); i += 4 {
+		pix[i] = lut[pix[i]]
+		pix[i+1] = lut[pix[i+1]]
+		pix[i+2] = lut[pix[i+2]]
+	}
+	return rgba
 }
 
 func rgbToHSL(r, g, b float64) (h, s, l float64) {

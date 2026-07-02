@@ -27,7 +27,8 @@ type DocumentViewer struct {
 	path           string
 	oldState       *term.State
 	fileType       string      // "pdf" or "epub"
-	tempDir        string      // for storing temporary image files
+	tempDir        string      // per-process dir for ephemeral files (dual/half frames, probe)
+	cacheDir       string      // persistent cross-session render cache (falls back to tempDir)
 	forceMode      string      // "", "text", or "image" - override auto-detection
 	fitMode        string      // "auto", "height", "width"
 	wantBack       bool        // signal to go back to file picker
@@ -66,6 +67,11 @@ type DocumentViewer struct {
 	ephemeralSeq      int
 	lastEphemeralPath string
 
+	// visualContent caches pageHasVisualContent per page number — the check
+	// renders the page, and getPageContentType runs it on every page display.
+	// Cleared in findContentPages on (re)open / relayout. Main-thread only.
+	visualContent map[int]bool
+
 	// Rendered-page cache (single-page image path): maps a render signature to an
 	// on-disk PNG so revisiting a page is instant, and a background goroutine can
 	// prefetch neighbors. go-fitz is internally mutex-locked, so concurrent renders
@@ -81,6 +87,10 @@ func NewDocumentViewer(path string) *DocumentViewer {
 	fileType := strings.TrimPrefix(ext, ".")
 
 	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("docviewer_%d", time.Now().UnixNano()))
+	cacheDir := persistentCacheDir()
+	if cacheDir == "" {
+		cacheDir = tempDir // no persistence, but everything still works
+	}
 
 	absPath, _ := filepath.Abs(path)
 	cfg := loadDocConfig(absPath)
@@ -89,6 +99,7 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		path:          path,
 		fileType:      fileType,
 		tempDir:       tempDir,
+		cacheDir:      cacheDir,
 		fitMode:       cfg.FitMode,
 		scaleFactor:   cfg.ScaleFactor,
 		darkMode:      cfg.DarkMode,
@@ -109,6 +120,9 @@ func NewDocumentViewer(path string) *DocumentViewer {
 }
 
 func (d *DocumentViewer) Open() error {
+	// Prune the persistent render cache in the background.
+	go gcPersistentCache(d.cacheDir)
+
 	if d.isImage {
 		f, err := os.Open(d.path)
 		if err != nil {
@@ -190,6 +204,10 @@ func (d *DocumentViewer) adjustHTMLZoom(delta int) {
 }
 
 func (d *DocumentViewer) findContentPages() {
+	// The document (or its layout) changed: previous visual-content results are
+	// stale (page numbering/content may differ), so reset the cache. The scan
+	// below repopulates it for sparse-text pages as a side effect.
+	d.visualContent = make(map[int]bool)
 	d.textPages = []int{}
 	for i := 0; i < d.doc.NumPage(); i++ {
 		hasContent := false
@@ -211,8 +229,27 @@ func (d *DocumentViewer) findContentPages() {
 	}
 }
 
+// pageHasVisualContent reports whether a page has non-blank visual content.
+// The underlying check renders the page, which is expensive — and this is
+// called from getPageContentType on EVERY page display — so results are cached
+// per page. The cache is cleared in findContentPages whenever the document is
+// (re)opened or relaid out. Main-thread only (plain map, no lock).
 func (d *DocumentViewer) pageHasVisualContent(pageNum int) bool {
-	img, err := d.doc.Image(pageNum)
+	if v, ok := d.visualContent[pageNum]; ok {
+		return v
+	}
+	v := d.computePageHasVisualContent(pageNum)
+	if d.visualContent == nil {
+		d.visualContent = make(map[int]bool)
+	}
+	d.visualContent[pageNum] = v
+	return v
+}
+
+func (d *DocumentViewer) computePageHasVisualContent(pageNum int) bool {
+	// 150 DPI instead of go-fitz's 300 DPI default: 4x fewer pixels to render,
+	// still ~20k+ sample points on a letter page — plenty for blank detection.
+	img, err := d.doc.ImageDPI(pageNum, 150)
 	if err != nil {
 		return false
 	}
@@ -363,6 +400,10 @@ func (d *DocumentViewer) Run() bool {
 	// Channel for external page jump commands via FIFO
 	pageChan := make(chan int, 1)
 
+	// Signaled when a background post-reload render has warmed the cache
+	// (see startReloadRender); the main loop then redraws as a cache hit.
+	reloadRenderChan := make(chan struct{}, 1)
+
 	// Set up FIFO for external control
 	d.setupFIFO()
 	defer d.cleanupFIFO()
@@ -413,10 +454,51 @@ func (d *DocumentViewer) Run() bool {
 			d.displayCurrentPage()
 		case <-ticker.C:
 			if d.checkAndReload() {
-				d.displayCurrentPage()
+				d.startReloadRender(reloadRenderChan)
 			}
+		case <-reloadRenderChan:
+			d.displayCurrentPage()
 		}
 	}
+}
+
+// startReloadRender warms the render cache for the current page in the
+// background after an auto-reload, then signals ch so the main loop redraws
+// (as a cache hit). The old page thus stays on screen during the MuPDF render
+// + PNG encode of the rebuilt file instead of the UI blocking in the ticker
+// handler. Display modes that don't use the single-page render cache signal
+// immediately and render synchronously as before. Must be called on the main
+// thread (it snapshots viewer state).
+func (d *DocumentViewer) startReloadRender(ch chan<- struct{}) {
+	signal := func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	if d.dualPageMode != "" || d.isImage || len(d.textPages) == 0 {
+		signal()
+		return
+	}
+	termWidth, termHeight := d.getTerminalSize()
+	// Match displayImagePage's available height (reserved 2 + top padding 1).
+	maxHeight := termHeight - 3
+	if maxHeight <= 0 {
+		signal()
+		return
+	}
+	pageNum := d.textPages[d.currentPage]
+	rp := d.snapshotParams()
+	termType := d.detectTerminalType()
+	go func() {
+		defer func() {
+			// A corrupt mid-recompile page must not crash the reader; the
+			// display path will fall back to a synchronous render attempt.
+			recover()
+			signal()
+		}()
+		d.savePageAsImage(pageNum, termWidth, maxHeight, termType, rp)
+	}()
 }
 
 func (d *DocumentViewer) cleanup() {
