@@ -292,6 +292,52 @@ func (d *DocumentViewer) restoreTerminal(old *term.State) {
 	}
 }
 
+// Synthetic key codes for the "uncrop" hotkeys (Cmd+Opt+[ / Cmd+Opt+] and
+// their Shift variants), delivered via the Kitty keyboard protocol's CSI u
+// encoding — Cmd (Super) has no legacy terminal representation, so these
+// combos can only be recognized through that protocol. Values are outside
+// any byte a real keypress or paste could plausibly produce.
+const (
+	keyUncropLeft   byte = 0xE0 // Cmd+Opt+[      — inverse of '['
+	keyUncropRight  byte = 0xE1 // Cmd+Opt+]      — inverse of ']'
+	keyUncropTop    byte = 0xE2 // Cmd+Opt+Shift+[ — inverse of '{'
+	keyUncropBottom byte = 0xE3 // Cmd+Opt+Shift+] — inverse of '}'
+)
+
+// parseKittyCSIU parses the parameter bytes of a Kitty keyboard protocol
+// "CSI u" sequence (the part between "ESC [" and the final 'u', e.g. "91;11"
+// or with the optional shifted-key/event-type suffixes "91:97;11:2") and
+// returns the base key code and the raw (1-based) modifier value. Returns
+// mods == 0 if no modifier field was present.
+func parseKittyCSIU(params []byte) (key int, mods int) {
+	fields := strings.Split(string(params), ";")
+	if len(fields) == 0 {
+		return 0, 0
+	}
+	key = firstIntField(fields[0])
+	if len(fields) > 1 {
+		mods = firstIntField(fields[1])
+	}
+	return key, mods
+}
+
+// firstIntField parses the leading decimal digits of s, stopping at the
+// first ':' (which separates shifted-key/base-key or modifier/event-type
+// sub-fields in the Kitty protocol).
+func firstIntField(s string) int {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return n
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
 func (d *DocumentViewer) readSingleChar() byte {
 	buf := make([]byte, 1)
 	n, _ := os.Stdin.Read(buf)
@@ -350,8 +396,29 @@ func (d *DocumentViewer) readSingleChar() byte {
 				return 'J'
 			}
 			return 'j'
+		case 'u': // Kitty keyboard protocol: CSI key ; modifiers u
+			key, rawMods := parseKittyCSIU(params)
+			if rawMods > 0 {
+				const altSuper = 2 | 8 // Alt + Super (Cmd) bits, 0-based
+				modBits := rawMods - 1
+				if modBits&altSuper == altSuper {
+					shiftHeld := modBits&1 != 0
+					switch key {
+					case '[':
+						if shiftHeld {
+							return keyUncropTop
+						}
+						return keyUncropLeft
+					case ']':
+						if shiftHeld {
+							return keyUncropBottom
+						}
+						return keyUncropRight
+					}
+				}
+			}
 		}
-		// Recognized escape sequence but not an arrow: swallow it entirely.
+		// Recognized escape sequence but not an arrow/known combo: swallow it.
 		return 0
 	}
 

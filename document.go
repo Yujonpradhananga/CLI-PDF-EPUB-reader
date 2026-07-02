@@ -390,6 +390,16 @@ func (d *DocumentViewer) Run() bool {
 	// than the SS3 ESC O A-D form that some terminals (e.g. agterm) default to.
 	fmt.Print("\033[?1l")
 
+	// Enable the Kitty keyboard protocol's "disambiguate escape codes" flag so
+	// Cmd (Super) modified keys — which have no legacy terminal representation
+	// — are reported as CSI u sequences (see readSingleChar/parseKittyCSIU).
+	// Only kitty-family terminals (kitty, ghostty, agterm) understand this;
+	// others ignore the private-marker CSI as a no-op.
+	if d.detectTerminalType() == "kitty" {
+		fmt.Print("\x1b[>1u")
+		defer fmt.Print("\x1b[<u")
+	}
+
 	d.currentPage = 0
 
 	// Channel for input from goroutine
@@ -849,6 +859,14 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		d.cropLeft = min(d.cropLeft+0.02, 0.45)
 	case ']': // cut more from right
 		d.cropRight = min(d.cropRight+0.02, 0.45)
+	case keyUncropTop: // cmd+opt+shift+[ — restore top edge (inverse of '{')
+		d.cropTop = max(d.cropTop-0.02, 0)
+	case keyUncropBottom: // cmd+opt+shift+] — restore bottom edge (inverse of '}')
+		d.cropBottom = max(d.cropBottom-0.02, 0)
+	case keyUncropLeft: // cmd+opt+[ — restore left edge (inverse of '[')
+		d.cropLeft = max(d.cropLeft-0.02, 0)
+	case keyUncropRight: // cmd+opt+] — restore right edge (inverse of ']')
+		d.cropRight = max(d.cropRight-0.02, 0)
 	case '\\': // backslash — reset all crops
 		d.cropTop, d.cropBottom, d.cropLeft, d.cropRight = 0, 0, 0, 0
 	case 27: // ESC key (arrow keys handled in readSingleChar)
