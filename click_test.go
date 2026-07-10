@@ -144,6 +144,97 @@ func TestCellToPDFDualHorizontal(t *testing.T) {
 	}
 }
 
+// roundTrip maps a cell through cellToPDF and back through pdfToCell,
+// requiring the result within ±1 cell of the original.
+func roundTrip(t *testing.T, m clickMap, col, row int) {
+	t.Helper()
+	page0, x, y, ok := m.cellToPDF(col, row)
+	if !ok {
+		t.Fatalf("cellToPDF(%d,%d) not mapped", col, row)
+	}
+	gotCol, gotRow, ok := m.pdfToCell(page0, x, y)
+	if !ok {
+		t.Fatalf("pdfToCell(page %d, %.2f, %.2f) not mapped", page0, x, y)
+	}
+	if abs(gotCol-col) > 1 || abs(gotRow-row) > 1 {
+		t.Errorf("round trip (%d,%d) -> (%.2f,%.2f) -> (%d,%d), want within ±1",
+			col, row, x, y, gotCol, gotRow)
+	}
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func TestPDFToCellRoundTripNoCrop(t *testing.T) {
+	m := singleMap(0, 1, 0, 1)
+	// Corners and interior of the 80x48 cell box at (11,2).
+	for _, c := range [][2]int{{11, 2}, {90, 49}, {51, 26}, {11, 49}, {90, 2}} {
+		roundTrip(t, m, c[0], c[1])
+	}
+}
+
+func TestPDFToCellRoundTripCropped(t *testing.T) {
+	// Same crop as TestCellToPDFCropped: the image shows [0.1,0.95]x[0.2,1.0].
+	m := singleMap(0.1, 0.95, 0.2, 1.0)
+	for _, c := range [][2]int{{11, 2}, {90, 49}, {51, 26}} {
+		roundTrip(t, m, c[0], c[1])
+	}
+
+	// A point cropped off screen (left of the visible band) must not map.
+	if _, _, ok := m.pdfToCell(4, 0.05*612, 0.5*792); ok {
+		t.Error("point in the cropped-away band must not map to a cell")
+	}
+	// A point on another page must not map either.
+	if _, _, ok := m.pdfToCell(5, 306, 396); ok {
+		t.Error("point on a page not displayed must not map to a cell")
+	}
+}
+
+func TestPDFToCellDualHorizontal(t *testing.T) {
+	m := clickMap{
+		originCol: 1, originRow: 1,
+		cols: 200, rows: 50,
+		pxW: 2000, pxH: 1000,
+		targets: []clickTarget{
+			{page0: 3, x0: 0, y0: 0, x1: 990, y1: 1000, pageW: 612, pageH: 792, fx0: 0, fx1: 1, fy0: 0, fy1: 1},
+			{page0: 7, x0: 1010, y0: 0, x1: 2000, y1: 1000, pageW: 612, pageH: 792, fx0: 0, fx1: 1, fy0: 0, fy1: 1},
+		},
+	}
+	// Cells inside each page's rect round-trip to the right page.
+	roundTrip(t, m, 26, 26)  // page 3
+	roundTrip(t, m, 151, 26) // page 7
+
+	// Page center of page 7 lands in the right half of the cell box.
+	col, _, ok := m.pdfToCell(7, 306, 396)
+	if !ok || col <= 101 {
+		t.Errorf("page 7 center mapped to col=%d ok=%v, want col > 101", col, ok)
+	}
+
+	var empty clickMap // text page: no map at all
+	if _, _, ok := empty.pdfToCell(3, 306, 396); ok {
+		t.Error("empty click map must not map any point")
+	}
+}
+
+func TestParseSyncCommand(t *testing.T) {
+	if s, ok := parseSyncCommand("7\n"); !ok || s.page != 7 || s.hasPoint {
+		t.Errorf("page-only: got %+v ok=%v", s, ok)
+	}
+	s, ok := parseSyncCommand("12 148.71 396.35\n")
+	if !ok || s.page != 12 || !s.hasPoint || !approxEq(s.x, 148.71) || !approxEq(s.y, 396.35) {
+		t.Errorf("page+point: got %+v ok=%v", s, ok)
+	}
+	for _, bad := range []string{"", "abc", "0", "-3", "5 1", "5 1 2 3", "5 x y", "5 1.0 y"} {
+		if _, ok := parseSyncCommand(bad); ok {
+			t.Errorf("parseSyncCommand(%q) must not parse", bad)
+		}
+	}
+}
+
 func TestParseSGRMouse(t *testing.T) {
 	if btn, col, row, ok := parseSGRMouse([]byte("8;42;17")); !ok || btn != 8 || col != 42 || row != 17 {
 		t.Errorf("alt+left press: got btn=%d col=%d row=%d ok=%v", btn, col, row, ok)

@@ -123,6 +123,40 @@ func (m *clickMap) cellToPDF(col, row int) (page0 int, x, y float64, ok bool) {
 	return 0, 0, 0, false
 }
 
+// pdfToCell maps (page0, x, y) — PDF points, top-left origin — to the 1-based
+// terminal cell showing that point: the inverse of cellToPDF, walking the same
+// targets, crop fractions, and cell box. ok is false when the map is empty
+// (text page), the page is not among the displayed targets, or the point lies
+// outside the visible band (cropped away / other half in half-page mode).
+func (m *clickMap) pdfToCell(page0 int, x, y float64) (col, row int, ok bool) {
+	if m.cols <= 0 || m.rows <= 0 || m.pxW <= 0 || m.pxH <= 0 {
+		return 0, 0, false
+	}
+	for _, t := range m.targets {
+		if t.page0 != page0 || t.pageW <= 0 || t.pageH <= 0 {
+			continue
+		}
+		if t.fx1 <= t.fx0 || t.fy1 <= t.fy0 {
+			continue
+		}
+		gx := x / t.pageW
+		gy := y / t.pageH
+		if gx < t.fx0 || gx > t.fx1 || gy < t.fy0 || gy > t.fy1 {
+			continue
+		}
+		px := t.x0 + (gx-t.fx0)/(t.fx1-t.fx0)*(t.x1-t.x0)
+		py := t.y0 + (gy-t.fy0)/(t.fy1-t.fy0)*(t.y1-t.y0)
+		col = m.originCol + int(px/m.pxW*float64(m.cols))
+		row = m.originRow + int(py/m.pxH*float64(m.rows))
+		// A point exactly on the band's far edge computes one cell past the
+		// box; clamp back inside.
+		col = min(col, m.originCol+m.cols-1)
+		row = min(row, m.originRow+m.rows-1)
+		return col, row, true
+	}
+	return 0, 0, false
+}
+
 // setPageClickMap records a whole-image single-page render for Opt+click:
 // the image's pixels show the fraction band [fx0,fx1]x[fy0,fy1] of pageNum.
 // Standalone images have no source to sync to, so the map stays cleared.

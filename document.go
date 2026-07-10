@@ -81,6 +81,15 @@ type DocumentViewer struct {
 	mouseCol int
 	mouseRow int
 
+	// Forward-sync flash marker (\lv in vim): a control-file jump that carries
+	// a synctex point (see parseSyncCommand) flashes a margin marker at the
+	// mapped row for flashDuration. Main-goroutine-only, like clickMap: the Run
+	// loop sets and clears flash, and the expiry goroutine armed in setFlash
+	// only sends its seq back over a channel. flashSeq outlives individual
+	// flashes so an expiry for an already-cleared flash is recognized as stale.
+	flash    flashState
+	flashSeq int
+
 	// visualContent caches pageHasVisualContent per page number — the check
 	// renders the page, and getPageContentType runs it on every page display.
 	// Cleared in findContentPages on (re)open / relayout. Main-thread only.
@@ -468,8 +477,14 @@ func (d *DocumentViewer) Run() bool {
 	stopChan := make(chan struct{})
 	defer close(stopChan)
 
-	// Channel for external page jump commands via FIFO
-	pageChan := make(chan int, 1)
+	// Channel for external forward-sync commands via the control file
+	syncChan := make(chan syncTarget, 1)
+
+	// Flash-marker expiry: the goroutine armed in setFlash sends its seq here
+	// after flashDuration; seqs from an already-replaced or cleared flash are
+	// ignored. Buffered past 1 so a stale seq sitting unread can't make a
+	// newer expiry drop its (non-blocking) send.
+	flashExpiryChan := make(chan int, 4)
 
 	// Signaled when a background post-reload render has warmed the cache
 	// (see startReloadRender); the main loop then redraws as a cache hit.
@@ -480,7 +495,7 @@ func (d *DocumentViewer) Run() bool {
 	defer d.cleanupFIFO()
 
 	// FIFO listener goroutine
-	go d.fifoListener(pageChan, stopChan)
+	go d.fifoListener(syncChan, stopChan)
 
 	// Input reader goroutine
 	go func() {
@@ -520,9 +535,18 @@ func (d *DocumentViewer) Run() bool {
 				d.showDebugInfo(inputChan)
 			}
 			d.displayCurrentPage()
-		case page := <-pageChan:
-			d.jumpToPage(page)
+		case t := <-syncChan:
+			d.jumpToPage(t.page)
+			d.flash = flashState{} // a jump without a point dismisses any pending flash
+			if t.hasPoint {
+				d.setFlash(t.page-1, t.x, t.y, flashExpiryChan)
+			}
 			d.displayCurrentPage()
+		case seq := <-flashExpiryChan:
+			if d.flash.active && d.flash.seq == seq {
+				d.flash = flashState{}
+				d.displayCurrentPage()
+			}
 		case <-ticker.C:
 			if d.checkAndReload() {
 				d.startReloadRender(reloadRenderChan)
@@ -594,7 +618,74 @@ func (d *DocumentViewer) cleanupFIFO() {
 	}
 }
 
-func (d *DocumentViewer) fifoListener(pageChan chan<- int, stopChan <-chan struct{}) {
+// syncTarget is a forward-sync command read from the control file: jump to
+// the 1-indexed page, optionally flashing a marker at (x, y) — PDF points,
+// top-left origin, the same coordinate space cellToPDF maps clicks into.
+type syncTarget struct {
+	page     int
+	x, y     float64
+	hasPoint bool
+}
+
+// flashState records a pending forward-sync flash marker. page0/x/y locate
+// the synctex point (PDF points, top-left origin); seq matches the expiry
+// goroutine's send against the flash it was armed for; drawn tracks whether
+// the jump's own redraw has painted the marker yet, so any LATER redraw
+// (keypress, reload, expiry) clears it instead of repainting.
+type flashState struct {
+	active bool
+	page0  int
+	x, y   float64
+	seq    int
+	drawn  bool
+}
+
+// flashDuration is how long the forward-sync marker stays on screen before
+// the expiry redraw removes it.
+const flashDuration = 1500 * time.Millisecond
+
+// setFlash records a flash target for the page jump being processed and arms
+// its expiry: after flashDuration the goroutine sends seq to expireChan and
+// the Run loop clears the flash if it is still the current one. Main
+// goroutine only.
+func (d *DocumentViewer) setFlash(page0 int, x, y float64, expireChan chan<- int) {
+	d.flashSeq++
+	d.flash = flashState{active: true, page0: page0, x: x, y: y, seq: d.flashSeq}
+	seq := d.flashSeq
+	go func() {
+		time.Sleep(flashDuration)
+		select {
+		case expireChan <- seq:
+		default:
+		}
+	}()
+}
+
+// parseSyncCommand parses one control-file command written by vim's forward
+// sync (DocViewerForwardSync in vimrc.d/latex.vim): either "page" — the
+// original jump-only format — or "page x y" with the synctex position of the
+// source line in PDF points, top-left origin. Anything else is rejected.
+func parseSyncCommand(line string) (syncTarget, bool) {
+	fields := strings.Fields(line)
+	if len(fields) != 1 && len(fields) != 3 {
+		return syncTarget{}, false
+	}
+	page, err := strconv.Atoi(fields[0])
+	if err != nil || page < 1 {
+		return syncTarget{}, false
+	}
+	if len(fields) == 1 {
+		return syncTarget{page: page}, true
+	}
+	x, errX := strconv.ParseFloat(fields[1], 64)
+	y, errY := strconv.ParseFloat(fields[2], 64)
+	if errX != nil || errY != nil {
+		return syncTarget{}, false
+	}
+	return syncTarget{page: page, x: x, y: y, hasPoint: true}, true
+}
+
+func (d *DocumentViewer) fifoListener(syncChan chan<- syncTarget, stopChan <-chan struct{}) {
 	var lastMod time.Time
 
 	for {
@@ -616,10 +707,9 @@ func (d *DocumentViewer) fifoListener(pageChan chan<- int, stopChan <-chan struc
 
 			data, err := os.ReadFile(d.fifoPath)
 			if err == nil {
-				line := strings.TrimSpace(string(data))
-				if page, err := strconv.Atoi(line); err == nil && page >= 1 {
+				if t, ok := parseSyncCommand(string(data)); ok {
 					select {
-					case pageChan <- page:
+					case syncChan <- t:
 					default:
 					}
 				}

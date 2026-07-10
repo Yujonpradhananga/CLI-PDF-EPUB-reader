@@ -15,6 +15,13 @@ func (d *DocumentViewer) displayCurrentPage() {
 	// paths below rebuild it (text pages leave it cleared, so clicks no-op).
 	d.clickMap = clickMap{}
 
+	// The redraw AFTER the one that painted the flash marker dismisses it —
+	// any keypress, page turn, reload, or the expiry itself. Only the sync
+	// jump's own redraw (flash set but not yet drawn) paints the marker.
+	if d.flash.drawn {
+		d.flash = flashState{}
+	}
+
 	// Begin synchronized update (Kitty) - buffers output for atomic display
 	fmt.Print("\033[?2026h")
 
@@ -36,6 +43,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	if d.dualPageMode == "half" {
 		d.displayHalfPage(termWidth, termHeight)
+		d.drawFlashMarker(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -43,6 +51,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	}
 	if d.dualPageMode != "" {
 		d.displayDualPage(termWidth, termHeight)
+		d.drawFlashMarker(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -60,6 +69,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	default:
 		d.displayTextPage(actualPage, termWidth, termHeight)
 	}
+	d.drawFlashMarker(termWidth)
 	fmt.Print("\033[9999;1H")
 
 	// Warm neighbor pages in the background so sequential reading is instant.
@@ -321,6 +331,36 @@ func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, image
 		fmt.Printf("\033[%d;%dH", row, termWidth)
 		fmt.Print("\033[43m \033[0m") // yellow block
 	}
+}
+
+// drawFlashMarker paints the forward-sync flash indicator recorded by
+// setFlash, using the clickMap the render path above just rebuilt: bold red
+// ▶ / ◀ in the margin columns immediately left and right of the image at the
+// target row. Like drawSearchMarkers, it draws beside the image rather than
+// over it: kittySendPNG places images at z-index 0, which the kitty graphics
+// protocol stacks above text, so a glyph at the target cell itself would be
+// covered. Marks the flash as drawn so the next redraw dismisses it; when the
+// point maps to no on-screen cell (page turned away, cropped off, text page)
+// the flash is spent without drawing anything.
+func (d *DocumentViewer) drawFlashMarker(termWidth int) {
+	if !d.flash.active {
+		return
+	}
+	d.flash.drawn = true
+	_, row, ok := d.clickMap.pdfToCell(d.flash.page0, d.flash.x, d.flash.y)
+	if !ok {
+		return
+	}
+	leftCol := d.clickMap.originCol - 1
+	if leftCol < 1 {
+		leftCol = 1
+	}
+	rightCol := d.clickMap.originCol + d.clickMap.cols
+	if rightCol > termWidth {
+		rightCol = termWidth
+	}
+	fmt.Printf("\033[%d;%dH\033[1;31m▶\033[0m", row, leftCol)
+	fmt.Printf("\033[%d;%dH\033[1;31m◀\033[0m", row, rightCol)
 }
 
 func (d *DocumentViewer) displayPageInfo(pageNum, termWidth int, contentType string) {
