@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -98,6 +99,27 @@ type DocumentViewer struct {
 	// renders the page, and getPageContentType runs it on every page display.
 	// Cleared in findContentPages on (re)open / relayout. Main-thread only.
 	visualContent map[int]bool
+
+	// pageLinks caches documentLinks per 0-indexed page: warmed in the
+	// background at display time (warmPageLinks), read on Ctrl+click.
+	// Guarded by linksMu; linksGen bumps on every invalidation so a warm
+	// goroutine that raced a reload discards its stale result. Nothing on
+	// the render/redraw path blocks on it.
+	pageLinks map[int][]pageLink
+	linksGen  int
+	linksMu   sync.Mutex
+
+	// Browser-style jump history (Cmd+Left / Cmd+Right). Entries hold PDF
+	// pages rather than textPages indices so they survive reloads. A link
+	// follow or forward-sync jump pushes onto backStack and clears fwdStack;
+	// historyBack/historyForward move between the stacks. Main-thread only.
+	backStack []viewLoc
+	fwdStack  []viewLoc
+
+	// syncChan carries jump targets to Run's select loop. fifoListener feeds
+	// it from the control file; handleCtrlClick feeds it internal link
+	// destinations so both take the same jump+flash path.
+	syncChan chan syncTarget
 
 	// Rendered-page cache (single-page image path): maps a render signature to an
 	// on-disk PNG so revisiting a page is instant, and a background goroutine can
@@ -233,8 +255,13 @@ func (d *DocumentViewer) adjustHTMLZoom(delta int) {
 func (d *DocumentViewer) findContentPages() {
 	// The document (or its layout) changed: previous visual-content results are
 	// stale (page numbering/content may differ), so reset the cache. The scan
-	// below repopulates it for sparse-text pages as a side effect.
+	// below repopulates it for sparse-text pages as a side effect. Cached
+	// links go stale the same way.
 	d.visualContent = make(map[int]bool)
+	d.linksMu.Lock()
+	d.pageLinks = make(map[int][]pageLink)
+	d.linksGen++
+	d.linksMu.Unlock()
 	d.textPages = []int{}
 	for i := 0; i < d.doc.NumPage(); i++ {
 		hasContent := false
@@ -481,8 +508,10 @@ func (d *DocumentViewer) Run() bool {
 	stopChan := make(chan struct{})
 	defer close(stopChan)
 
-	// Channel for external forward-sync commands via the control file
+	// Channel for forward-sync commands: external via the control file,
+	// internal via Ctrl+click link follows (handleCtrlClick).
 	syncChan := make(chan syncTarget, 1)
+	d.syncChan = syncChan
 
 	// Signaled when a background post-reload render has warmed the cache
 	// (see startReloadRender); the main loop then redraws as a cache hit.
@@ -541,9 +570,18 @@ func (d *DocumentViewer) Run() bool {
 				d.showHelp(inputChan)
 			case -4:
 				d.showDebugInfo(inputChan)
+			case -5:
+				// A link follow queued its target on syncChan; that case
+				// jumps and redraws — don't redraw the old page first.
+				continue
 			}
 			d.displayCurrentPage()
 		case t := <-syncChan:
+			// Any sync jump — vim forward sync or a followed link — is a
+			// navigation: record where we were for Cmd+Left. A jump that
+			// lands where it started leaves a stale top entry, which
+			// historyBack skips.
+			d.pushHistory()
 			d.jumpToPage(t.page)
 			d.flash = flashState{} // a jump without a point dismisses any current marker
 			if t.hasPoint {
@@ -560,6 +598,12 @@ func (d *DocumentViewer) Run() bool {
 				})
 			}
 			d.displayCurrentPage()
+			// A click captured before this jump would map through the new
+			// page's clickMap; discard any pending coordinates so it is
+			// rejected instead of following a link the user never saw.
+			d.mouseMu.Lock()
+			d.mouseCol, d.mouseRow = 0, 0
+			d.mouseMu.Unlock()
 		case <-flashChan:
 			d.clearFlashRule()
 			os.Stdout.Sync()
@@ -772,6 +816,82 @@ func (d *DocumentViewer) fifoListener(syncChan chan<- syncTarget, stopChan <-cha
 
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// viewLoc is one jump-history entry: a 0-indexed PDF page plus which half was
+// showing. PDF pages (not textPages indices) survive reloads — jumpToPage
+// re-resolves them with a closest-match.
+type viewLoc struct {
+	page0      int
+	halfOffset int
+}
+
+// currentLoc captures the on-screen location for the history stacks.
+func (d *DocumentViewer) currentLoc() (viewLoc, bool) {
+	if len(d.textPages) == 0 || d.currentPage < 0 || d.currentPage >= len(d.textPages) {
+		return viewLoc{}, false
+	}
+	return viewLoc{page0: d.textPages[d.currentPage], halfOffset: d.halfPageOffset}, true
+}
+
+// pushHistory records the current location before a navigation jump and, like
+// a browser, clears the forward stack. Consecutive duplicates are dropped so
+// repeated syncs to the same page don't pile up.
+func (d *DocumentViewer) pushHistory() {
+	loc, ok := d.currentLoc()
+	if !ok {
+		return
+	}
+	if n := len(d.backStack); n > 0 && d.backStack[n-1] == loc {
+		d.fwdStack = nil
+		return
+	}
+	d.backStack = append(d.backStack, loc)
+	d.fwdStack = nil
+}
+
+// historyBack (Cmd+Left) returns to where the last jump came from, moving the
+// current location to the forward stack. Entries equal to the current
+// location are skipped: a jump that landed where it started left one behind.
+func (d *DocumentViewer) historyBack() {
+	cur, curOK := d.currentLoc()
+	for len(d.backStack) > 0 {
+		loc := d.backStack[len(d.backStack)-1]
+		d.backStack = d.backStack[:len(d.backStack)-1]
+		if curOK && loc == cur {
+			continue
+		}
+		if curOK {
+			d.fwdStack = append(d.fwdStack, cur)
+		}
+		d.applyLoc(loc)
+		return
+	}
+}
+
+// historyForward (Cmd+Right) re-applies a jump undone by historyBack.
+func (d *DocumentViewer) historyForward() {
+	cur, curOK := d.currentLoc()
+	for len(d.fwdStack) > 0 {
+		loc := d.fwdStack[len(d.fwdStack)-1]
+		d.fwdStack = d.fwdStack[:len(d.fwdStack)-1]
+		if curOK && loc == cur {
+			continue
+		}
+		if curOK {
+			d.backStack = append(d.backStack, cur)
+		}
+		d.applyLoc(loc)
+		return
+	}
+}
+
+// applyLoc jumps to a history location. A history move is itself a jump, so
+// it dismisses any forward-sync marker, matching the point-less sync case.
+func (d *DocumentViewer) applyLoc(loc viewLoc) {
+	d.jumpToPage(loc.page0 + 1)
+	d.halfPageOffset = loc.halfOffset
+	d.flash = flashState{}
 }
 
 func (d *DocumentViewer) jumpToPage(page int) {
@@ -1014,6 +1134,14 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		d.syncToVim()
 	case keyMouseAltClick: // Opt+left click — synctex jump at the clicked point
 		d.handleAltClick()
+	case keyMouseCtrlClick: // Ctrl+left click — follow the hyperlink under it
+		if d.handleCtrlClick() {
+			return -5 // internal jump queued on syncChan; its case redraws
+		}
+	case keyHistoryBack: // Cmd+Left — back through the jump history
+		d.historyBack()
+	case keyHistoryForward: // Cmd+Right — forward again
+		d.historyForward()
 	case 'O':
 		absPath, _ := filepath.Abs(d.path)
 		exec.Command("open", "-R", absPath).Start()
@@ -1126,6 +1254,119 @@ func (d *DocumentViewer) handleAltClick() {
 		return
 	}
 	d.syncToVimAt(page0, x, y)
+}
+
+// linksForPage returns the cached links of a 0-indexed page, extracting them
+// on first use. Extraction is a few MuPDF calls (no rendering), but it waits
+// on go-fitz's document mutex, which queued prefetch renders can hold for
+// seconds — hence warmPageLinks below. Main goroutine only.
+func (d *DocumentViewer) linksForPage(page0 int) []pageLink {
+	if d.doc == nil {
+		return nil
+	}
+	d.linksMu.Lock()
+	links, ok := d.pageLinks[page0]
+	d.linksMu.Unlock()
+	if ok {
+		return links
+	}
+	links = documentLinks(d.doc, page0)
+	d.linksMu.Lock()
+	d.pageLinks[page0] = links
+	d.linksMu.Unlock()
+	return links
+}
+
+// warmPageLinks extracts a page's links in the background so the first
+// Ctrl+click finds them cached. Spawned at display time just before the
+// neighbor prefetch renders, so it takes the go-fitz mutex ahead of them;
+// a click a moment later is then a map hit instead of a multi-second wait
+// behind queued 600-DPI renders. doc is captured by the caller on the main
+// goroutine; the generation check discards results that raced a reload.
+func (d *DocumentViewer) warmPageLinks(doc *fitz.Document, page0 int) {
+	if doc == nil {
+		return
+	}
+	d.linksMu.Lock()
+	_, ok := d.pageLinks[page0]
+	gen := d.linksGen
+	d.linksMu.Unlock()
+	if ok {
+		return
+	}
+	links := documentLinks(doc, page0)
+	d.linksMu.Lock()
+	if d.linksGen == gen {
+		d.pageLinks[page0] = links
+	}
+	d.linksMu.Unlock()
+}
+
+// allowedExternalScheme reports whether a link URI is safe to hand to macOS
+// `open`. fz_is_external_link means merely "the URI has a scheme", which
+// includes file://, smb://, and arbitrary app schemes that LaunchServices
+// would act on without any confirmation — a hostile PDF must not fire those.
+func allowedExternalScheme(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "mailto":
+		return true
+	}
+	return false
+}
+
+func openExternalURI(uri string) {
+	if allowedExternalScheme(uri) {
+		exec.Command("open", uri).Start()
+	}
+}
+
+// handleCtrlClick follows the hyperlink under the last Ctrl+click: an
+// external URI opens via macOS `open`; an internal destination goes through
+// syncChan, taking the exact jump+flash+half-roll path of a vim forward sync
+// so the target line gets the same transient rule. Returns true when an
+// internal jump was queued (the caller then skips its redraw). Clicks that
+// hit no link, a text page, or an unresolvable destination do nothing.
+func (d *DocumentViewer) handleCtrlClick() bool {
+	d.mouseMu.Lock()
+	col, row := d.mouseCol, d.mouseRow
+	// Consume the coordinates, like handleAltClick: a stray 0xE9 byte then
+	// maps through (0,0) and is rejected instead of replaying the last click.
+	d.mouseCol, d.mouseRow = 0, 0
+	d.mouseMu.Unlock()
+	page0, x, y, ok := d.clickMap.cellToPDF(col, row)
+	if !ok {
+		return false
+	}
+	tolX, tolY := linkTolX, linkTolY
+	if w, h, ok := d.clickMap.cellSizePDF(page0); ok {
+		tolX = math.Max(tolX, w/2)
+		tolY = math.Max(tolY, h/2)
+	}
+	link, ok := findLinkAt(d.linksForPage(page0), x, y, tolX, tolY)
+	if !ok {
+		return false
+	}
+	if link.external {
+		openExternalURI(link.uri)
+		return false
+	}
+	if link.destPage0 < 0 || d.syncChan == nil {
+		return false
+	}
+	// A destination of exactly (0,0) is a bare "go to page" with no anchor
+	// point; jump without flashing a rule at the page's top-left corner.
+	t := syncTarget{page: link.destPage0 + 1, x: link.destX, y: link.destY,
+		hasPoint: link.destX != 0 || link.destY != 0}
+	select {
+	case d.syncChan <- t:
+		return true
+	default:
+		return false // a control-file jump got there first; let it win
+	}
 }
 
 // syncToVim ('v' key): inverse sync at the center of the current page.

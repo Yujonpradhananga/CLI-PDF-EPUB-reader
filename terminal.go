@@ -310,6 +310,18 @@ const (
 // coordinates, so the viewer fields are the side channel to handleAltClick.
 const keyMouseAltClick byte = 0xE8
 
+// keyMouseCtrlClick is the Ctrl+left press counterpart: follow the hyperlink
+// under the click (see handleCtrlClick). Same cell side channel.
+const keyMouseCtrlClick byte = 0xE9
+
+// Cmd+Left / Cmd+Right — browser-style back/forward through the jump history.
+// Modified arrows keep their CSI 1;mods A-D shape (unlike Cmd+letter combos,
+// which need the CSI u encoding); Super contributes bit 8 of mods-1.
+const (
+	keyHistoryBack    byte = 0xEA // Cmd+Left
+	keyHistoryForward byte = 0xEB // Cmd+Right
+)
+
 // parseKittyCSIU parses the parameter bytes of a Kitty keyboard protocol
 // "CSI u" sequence (the part between "ESC [" and the final 'u', e.g. "91;11"
 // or with the optional shifted-key/event-type suffixes "91:97;11:2") and
@@ -378,6 +390,11 @@ func (d *DocumentViewer) readSingleChar() byte {
 		// or swallow it. We must never let leftover bytes ('[', ']', 'C', 'D', ...)
 		// flow back as commands, because those are destructive (crop / dark mode).
 		if buf[0] != 27 {
+			// Bytes >= 0x80 (pasted or IME-typed UTF-8) must not surface as
+			// commands: they would forge the 0xE0-0xEB synthetic keys.
+			if buf[0] >= 0x80 {
+				continue
+			}
 			return buf[0]
 		}
 
@@ -403,22 +420,32 @@ func (d *DocumentViewer) readSingleChar() byte {
 			params = append(params, b[0])
 		}
 
-		// Shift modifier shows up as a ";2" parameter (e.g. ESC [ 1 ; 2 C).
-		shift := false
+		// Arrow modifiers arrive as CSI 1 ; mods A-D, where mods-1 is a bit
+		// set: 1 Shift, 2 Alt, 4 Ctrl, 8 Super (Cmd).
+		shift, super := false, false
 		for i := 0; i+1 < len(params); i++ {
-			if params[i] == ';' && params[i+1] == '2' {
-				shift = true
+			if params[i] == ';' {
+				if modBits := firstIntField(string(params[i+1:])) - 1; modBits > 0 {
+					shift = modBits&1 != 0
+					super = modBits&8 != 0
+				}
 				break
 			}
 		}
 
 		switch final {
 		case 'A', 'D': // Up / Left -> previous page
+			if super && final == 'D' { // Cmd+Left: history back
+				return keyHistoryBack
+			}
 			if shift {
 				return 'K'
 			}
 			return 'k'
 		case 'B', 'C': // Down / Right -> next page
+			if super && final == 'C' { // Cmd+Right: history forward
+				return keyHistoryForward
+			}
 			if shift {
 				return 'J'
 			}
@@ -448,15 +475,26 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if len(params) > 0 && params[0] == '<' {
 				// SGR encoding: ESC [ < btn ; col ; row, final M=press m=release.
 				// btn bits: low 2 = button (0=left), +4 shift, +8 alt, +16 ctrl,
-				// +32 motion, 64/65 wheel. Only an unmodified Opt+left press
-				// (btn == 0|8 exactly) becomes a key; every other mouse event is
+				// +32 motion, 64/65 wheel. Only Opt+left (btn == 0|8) and
+				// Ctrl+left (btn == 0|16; also 2|16 for terminals that apply the
+				// macOS Ctrl+click -> secondary-click translation before
+				// reporting) presses become keys; every other mouse event is
 				// consumed silently.
 				btn, col, row, ok := parseSGRMouse(params[1:])
-				if ok && final == 'M' && btn == 8 {
-					d.mouseMu.Lock()
-					d.mouseCol, d.mouseRow = col, row
-					d.mouseMu.Unlock()
-					return keyMouseAltClick
+				if ok && final == 'M' {
+					var key byte
+					switch btn {
+					case 8:
+						key = keyMouseAltClick
+					case 16, 18:
+						key = keyMouseCtrlClick
+					}
+					if key != 0 {
+						d.mouseMu.Lock()
+						d.mouseCol, d.mouseRow = col, row
+						d.mouseMu.Unlock()
+						return key
+					}
 				}
 				continue
 			}

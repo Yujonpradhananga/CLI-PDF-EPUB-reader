@@ -168,6 +168,25 @@ func (m *clickMap) pdfToCell(page0 int, x, y float64) (col, row int, ok bool) {
 	return 0, 0, false
 }
 
+// cellSizePDF reports the page-point footprint of one terminal cell for the
+// target showing page0. Click-resolution tolerances (findLinkAt) must track
+// it: dual and half layouts change how much page a cell covers, and a
+// tolerance tuned for single-page cells makes thin links unhittable there.
+func (m *clickMap) cellSizePDF(page0 int) (w, h float64, ok bool) {
+	if m.cols <= 0 || m.rows <= 0 || m.pxW <= 0 || m.pxH <= 0 {
+		return 0, 0, false
+	}
+	for _, t := range m.targets {
+		if t.page0 != page0 || t.x1 <= t.x0 || t.y1 <= t.y0 {
+			continue
+		}
+		w = m.pxW / float64(m.cols) / (t.x1 - t.x0) * (t.fx1 - t.fx0) * t.pageW
+		h = m.pxH / float64(m.rows) / (t.y1 - t.y0) * (t.fy1 - t.fy0) * t.pageH
+		return w, h, true
+	}
+	return 0, 0, false
+}
+
 // setPageClickMap records a whole-image single-page render for Opt+click:
 // the image's pixels show the fraction band [fx0,fx1]x[fy0,fy1] of pageNum.
 // Standalone images have no source to sync to, so the map stays cleared.

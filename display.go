@@ -70,7 +70,13 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	// Warm neighbor pages in the background so sequential reading is instant.
 	// Gated on the current page being an image (image-heavy docs like math PDFs).
+	// The page's links warm first: spawned ahead of the prefetch renders, the
+	// extraction takes the go-fitz mutex before they monopolize it, so a
+	// Ctrl+click moments after display is a cache hit instead of a wait.
 	if contentType == "image" {
+		if d.doc != nil {
+			go d.warmPageLinks(d.doc, actualPage)
+		}
 		d.prefetchNeighbors(termWidth, termHeight)
 	}
 
@@ -677,6 +683,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  j/Space/Down/Right  - Next page")
 	p("  k/Up/Left           - Previous page")
 	p("  g                   - Go to specific page")
+	p("  Cmd+Left/Right      - Back / forward through jump history")
 	p("  b                   - Back to file list")
 	p("")
 	p("Search:")
@@ -711,6 +718,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  O                   - Reveal in Finder")
 	p("  v                   - Jump vim to this page's source (synctex)")
 	p("  Opt+Click           - Jump vim to clicked line (synctex)")
+	p("  Ctrl+Click          - Follow link under click (refs, citations, URLs)")
 	p("  h or ?              - Show this help")
 	p("  q                   - Quit")
 	p("")
