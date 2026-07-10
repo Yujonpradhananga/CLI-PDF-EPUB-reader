@@ -9,6 +9,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -630,13 +631,42 @@ func (d *DocumentViewer) setFlash(page0 int, x, y float64) {
 	d.flash = flashState{active: true, page0: page0, x: x, y: y}
 }
 
-// rollHalfToSyncPoint switches the half-page view to the half that contains the
-// forward-synced point, using the bands each half actually shows (halfPageBands:
-// ~55% of the page each, less whatever the user's outer-edge crop trims). A
-// point in the overlap is visible in either half, so the current one is kept; a
-// point trimmed off both halves picks the half whose uncropped band holds it, so
-// the marker at least lands on the right side of the page. No-op outside
-// half-page mode.
+// chooseHalf picks the half-page offset (0 top, 1 bottom) that best shows the
+// point at page-height fraction fy, given the bands the two halves display and
+// the half currently on screen. The halves overlap — by a lot when a clamped
+// DPI makes each band well over 55% of the page — so "the point is somewhere in
+// this band" is too weak a test: it leaves the point pressed against the top or
+// bottom edge of the screen. A band counts only when fy sits at least
+// halfEdgeMargin of the band's height inside it. Preferring the current half
+// when it qualifies gives repeated syncs to nearby lines hysteresis instead of
+// flipping the view back and forth.
+func chooseHalf(fy, topY0, topY1, botY0, botY1 float64, current int) int {
+	const halfEdgeMargin = 0.15
+	comfortable := func(y0, y1 float64) bool {
+		m := (y1 - y0) * halfEdgeMargin
+		return fy >= y0+m && fy <= y1-m
+	}
+	inTop, inBottom := comfortable(topY0, topY1), comfortable(botY0, botY1)
+	switch {
+	case current == 0 && inTop, current == 1 && inBottom:
+		return current
+	case inTop:
+		return 0
+	case inBottom:
+		return 1
+	}
+	// Neither half shows the point clear of an edge (or a crop hides it
+	// entirely): put it on the half whose band it is nearest the middle of.
+	if math.Abs(fy-(topY0+topY1)/2) <= math.Abs(fy-(botY0+botY1)/2) {
+		return 0
+	}
+	return 1
+}
+
+// rollHalfToSyncPoint switches the half-page view to the half that best shows
+// the forward-synced point, using the bands each half actually displays
+// (halfPageBands), which depend on the render DPI and on the user's outer-edge
+// crop. No-op outside half-page mode.
 func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
 	if d.dualPageMode != "half" || d.doc == nil {
 		return
@@ -650,23 +680,7 @@ func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
 	if !ok {
 		return
 	}
-
-	fy := y / float64(r.Dy())
-	inTop := fy >= topY0 && fy <= topY1
-	inBottom := fy >= botY0 && fy <= botY1
-
-	switch {
-	case inTop && inBottom:
-		// overlap: whichever half is showing already displays the point
-	case inTop:
-		d.halfPageOffset = 0
-	case inBottom:
-		d.halfPageOffset = 1
-	case fy <= topY1:
-		d.halfPageOffset = 0
-	default:
-		d.halfPageOffset = 1
-	}
+	d.halfPageOffset = chooseHalf(y/float64(r.Dy()), topY0, topY1, botY0, botY1, d.halfPageOffset)
 }
 
 // parseSyncCommand parses one control-file command written by vim's forward

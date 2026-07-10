@@ -235,6 +235,48 @@ func TestParseSyncCommand(t *testing.T) {
 	}
 }
 
+func TestChooseHalf(t *testing.T) {
+	// Uncropped bands at the nominal 55% split.
+	const t0, t1, b0, b1 = 0.0, 0.55, 0.45, 1.0
+	cases := []struct {
+		fy      float64
+		current int
+		want    int
+	}{
+		{0.10, 0, 0}, // clearly in the top half
+		{0.10, 1, 0}, // ...and roll up to it from the bottom
+		{0.90, 1, 1}, // clearly in the bottom half
+		{0.90, 0, 1},
+		{0.30, 1, 0}, // top half, comfortably clear of its bottom edge
+		{0.70, 0, 1},
+		{0.50, 0, 0}, // dead centre: neither half shows it clear of an edge, so nearest band centre wins
+		{0.52, 0, 1}, // just below centre: nearer the bottom band's centre, and 95% down the top half
+		{0.48, 1, 0},
+		{0.03, 1, 0}, // above the top half's comfort zone: still the top half
+		{0.98, 0, 1},
+	}
+	for _, c := range cases {
+		if got := chooseHalf(c.fy, t0, t1, b0, b1, c.current); got != c.want {
+			t.Errorf("chooseHalf(fy=%.2f, current=%d) = %d, want %d", c.fy, c.current, got, c.want)
+		}
+	}
+
+	// Clamped DPI: each half shows 69% of the page, so the bands overlap over
+	// [0.31,0.69]. Mere containment would pin the point to a screen edge.
+	if got := chooseHalf(0.60, 0, 0.69, 0.31, 1.0, 0); got != 1 {
+		t.Errorf("wide overlap, fy=0.60 on top half: got %d, want 1 (0.60 sits at the very bottom of the top band)", got)
+	}
+	if got := chooseHalf(0.35, 0, 0.69, 0.31, 1.0, 1); got != 0 {
+		t.Errorf("wide overlap, fy=0.35 on bottom half: got %d, want 0", got)
+	}
+
+	// cropTop=0.2 trims the top half to [0.11,0.55]; a point in the trimmed
+	// strip is invisible either way, so it stays on the half it belongs to.
+	if got := chooseHalf(0.05, 0.11, 0.55, 0.45, 1.0, 1); got != 0 {
+		t.Errorf("cropped-away point: got %d, want 0", got)
+	}
+}
+
 func TestParseSGRMouse(t *testing.T) {
 	if btn, col, row, ok := parseSGRMouse([]byte("8;42;17")); !ok || btn != 8 || col != 42 || row != 17 {
 		t.Errorf("alt+left press: got btn=%d col=%d row=%d ok=%v", btn, col, row, ok)
