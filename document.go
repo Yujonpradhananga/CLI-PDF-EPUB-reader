@@ -532,6 +532,7 @@ func (d *DocumentViewer) Run() bool {
 			d.flash = flashState{} // a jump without a point dismisses any current marker
 			if t.hasPoint {
 				d.setFlash(t.page-1, t.x, t.y)
+				d.rollHalfToSyncPoint(t.page-1, t.y)
 			}
 			d.displayCurrentPage()
 		case <-ticker.C:
@@ -627,6 +628,27 @@ type flashState struct {
 // Main goroutine only.
 func (d *DocumentViewer) setFlash(page0 int, x, y float64) {
 	d.flash = flashState{active: true, page0: page0, x: x, y: y}
+}
+
+// rollHalfToSyncPoint switches the half-page view to the half that contains
+// the forward-synced point, mirroring renderHalfPage's bands: the top half
+// shows the first ~55% of the page, the bottom half the last ~55%. A point
+// in the 45–55% overlap is visible in either half, so the current one is
+// kept. No-op outside half-page mode.
+func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
+	if d.dualPageMode != "half" || d.doc == nil {
+		return
+	}
+	r, err := d.doc.Bound(page0)
+	if err != nil || r.Dy() <= 0 {
+		return
+	}
+	fy := y / float64(r.Dy())
+	if fy > 0.55 {
+		d.halfPageOffset = 1
+	} else if fy < 0.45 {
+		d.halfPageOffset = 0
+	}
 }
 
 // parseSyncCommand parses one control-file command written by vim's forward
