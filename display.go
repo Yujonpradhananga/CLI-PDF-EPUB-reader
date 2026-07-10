@@ -11,6 +11,10 @@ func (d *DocumentViewer) displayCurrentPage() {
 	termWidth, termHeight := d.getTerminalSize()
 	actualPage := d.textPages[d.currentPage]
 
+	// Any previous Opt+click map is stale once we redraw; the image render
+	// paths below rebuild it (text pages leave it cleared, so clicks no-op).
+	d.clickMap = clickMap{}
+
 	// Begin synchronized update (Kitty) - buffers output for atomic display
 	fmt.Print("\033[?2026h")
 
@@ -573,6 +577,8 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  S                   - Open in Skim")
 	p("  P                   - Open in Preview")
 	p("  O                   - Reveal in Finder")
+	p("  v                   - Jump vim to this page's source (synctex)")
+	p("  Opt+Click           - Jump vim to clicked line (synctex)")
 	p("  h or ?              - Show this help")
 	p("  q                   - Quit")
 	p("")

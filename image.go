@@ -72,6 +72,82 @@ func (d *DocumentViewer) saveEphemeralPNG(prefix string, img image.Image) (strin
 	return imagePath, nil
 }
 
+// clickTarget maps a pixel rectangle of the transmitted image back to a page
+// sub-region: pixels [x0,x1)x[y0,y1) of the image show the fraction band
+// [fx0,fx1]x[fy0,fy1] of a page whose box is pageW x pageH PDF points.
+type clickTarget struct {
+	page0              int // 0-indexed PDF page
+	x0, y0, x1, y1     float64
+	pageW, pageH       float64
+	fx0, fx1, fy0, fy1 float64
+}
+
+// clickMap records where the last-drawn image sits on screen (cells) and which
+// page regions its pixels show, so an Opt+click cell can be mapped back to PDF
+// points for synctex (see handleAltClick). Rebuilt on every image display and
+// zeroed at the top of displayCurrentPage, so text pages have no map.
+type clickMap struct {
+	originCol, originRow int // 1-based cell of the image's top-left corner
+	cols, rows           int // cell box the terminal scales the image into
+	pxW, pxH             float64
+	targets              []clickTarget
+}
+
+// cellToPDF maps a 1-based terminal cell to (page, x, y) in PDF points with
+// top-left origin. The kitty graphics protocol stretches the transmitted image
+// to exactly cols x rows cells, so a fraction of the cell box equals the same
+// fraction of the image pixels; the cell center stands in for the unknowable
+// sub-cell click position. ok is false outside the displayed image (or inside
+// the gap between dual-mode pages).
+func (m *clickMap) cellToPDF(col, row int) (page0 int, x, y float64, ok bool) {
+	if m.cols <= 0 || m.rows <= 0 || m.pxW <= 0 || m.pxH <= 0 {
+		return 0, 0, 0, false
+	}
+	fx := (float64(col-m.originCol) + 0.5) / float64(m.cols)
+	fy := (float64(row-m.originRow) + 0.5) / float64(m.rows)
+	if fx < 0 || fx >= 1 || fy < 0 || fy >= 1 {
+		return 0, 0, 0, false
+	}
+	px := fx * m.pxW
+	py := fy * m.pxH
+	for _, t := range m.targets {
+		if px < t.x0 || px >= t.x1 || py < t.y0 || py >= t.y1 {
+			continue
+		}
+		gx := t.fx0 + (px-t.x0)/(t.x1-t.x0)*(t.fx1-t.fx0)
+		gy := t.fy0 + (py-t.y0)/(t.y1-t.y0)*(t.fy1-t.fy0)
+		x = math.Min(math.Max(gx*t.pageW, 0), t.pageW)
+		y = math.Min(math.Max(gy*t.pageH, 0), t.pageH)
+		return t.page0, x, y, true
+	}
+	return 0, 0, 0, false
+}
+
+// setPageClickMap records a whole-image single-page render for Opt+click:
+// the image's pixels show the fraction band [fx0,fx1]x[fy0,fy1] of pageNum.
+// Standalone images have no source to sync to, so the map stays cleared.
+func (d *DocumentViewer) setPageClickMap(pageNum, originCol, originRow, rows, cols, pxW, pxH int, fx0, fx1, fy0, fy1 float64) {
+	d.clickMap = clickMap{}
+	if d.isImage || d.doc == nil {
+		return
+	}
+	r, err := d.doc.Bound(pageNum)
+	if err != nil || r.Dx() <= 0 || r.Dy() <= 0 {
+		return
+	}
+	d.clickMap = clickMap{
+		originCol: originCol, originRow: originRow,
+		cols: cols, rows: rows,
+		pxW: float64(pxW), pxH: float64(pxH),
+		targets: []clickTarget{{
+			page0: pageNum,
+			x1:    float64(pxW), y1: float64(pxH),
+			pageW: float64(r.Dx()), pageH: float64(r.Dy()),
+			fx0: fx0, fx1: fx1, fy0: fy0, fy1: fy1,
+		}},
+	}
+}
+
 func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 	return d.renderPageImageAligned(pageNum, maxWidth, maxHeight, "center")
 }
@@ -101,6 +177,14 @@ func (d *DocumentViewer) renderPageImageAligned(pageNum, maxWidth, maxHeight int
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
+
+	// Opt+click map. Both callers (displayImagePage, displayMixedPage) position
+	// the cursor at row 2, column 1 before rendering, so the image's top-left
+	// cell is (row 2, col 1+offset). The visible band of the page is the whole
+	// page minus the user crop fractions (cropImage in savePageAsImage).
+	d.setPageClickMap(pageNum, 1+horizontalOffset, 2, actualHeight, imageWidthInChars,
+		actualPixelWidth, actualPixelHeight,
+		rp.cropLeft, 1-rp.cropRight, rp.cropTop, 1-rp.cropBottom)
 
 	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, actualPixelWidth, actualPixelHeight, termType)
 }
@@ -407,6 +491,27 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	return img, nil
 }
 
+// dualClickTarget builds the Opt+click target for one page of a dual-mode
+// composite: the page image occupies pixel rect [x0,x1)x[y0,y1) of the
+// composite and shows the page minus the user crop fractions (cropImage is
+// applied per page in renderDualComposite).
+func (d *DocumentViewer) dualClickTarget(pageNum, x0, y0, x1, y1 int) (clickTarget, bool) {
+	if d.isImage || d.doc == nil {
+		return clickTarget{}, false
+	}
+	r, err := d.doc.Bound(pageNum)
+	if err != nil || r.Dx() <= 0 || r.Dy() <= 0 {
+		return clickTarget{}, false
+	}
+	return clickTarget{
+		page0: pageNum,
+		x0:    float64(x0), y0: float64(y0), x1: float64(x1), y1: float64(y1),
+		pageW: float64(r.Dx()), pageH: float64(r.Dy()),
+		fx0: d.cropLeft, fx1: 1 - d.cropRight,
+		fy0: d.cropTop, fy1: 1 - d.cropBottom,
+	}, true
+}
+
 // renderDualComposite renders two pages as a single composited image.
 // layout is "vertical" (stacked) or "horizontal" (side-by-side).
 // gap is the pixel gap between pages.
@@ -455,6 +560,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 	// Build composite image
 	var composite *image.RGBA
 	var compositeW, compositeH int
+	var targets []clickTarget
 
 	if layout == "vertical" {
 		compositeW = b1.Dx()
@@ -478,12 +584,18 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		// Center page 1 horizontally
 		x1 := (compositeW - b1.Dx()) / 2
 		draw.Draw(composite, image.Rect(x1, 0, x1+b1.Dx(), b1.Dy()), page1Img, b1.Min, draw.Over)
+		if t, ok := d.dualClickTarget(page1, x1, 0, x1+b1.Dx(), b1.Dy()); ok {
+			targets = append(targets, t)
+		}
 
 		if page2Img != nil {
 			b2 := page2Img.Bounds()
 			x2 := (compositeW - b2.Dx()) / 2
 			y2 := b1.Dy() + gap
 			draw.Draw(composite, image.Rect(x2, y2, x2+b2.Dx(), y2+b2.Dy()), page2Img, b2.Min, draw.Over)
+			if t, ok := d.dualClickTarget(page2, x2, y2, x2+b2.Dx(), y2+b2.Dy()); ok {
+				targets = append(targets, t)
+			}
 		}
 	} else {
 		// Horizontal
@@ -507,12 +619,18 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		// Center page 1 vertically
 		y1 := (compositeH - b1.Dy()) / 2
 		draw.Draw(composite, image.Rect(0, y1, b1.Dx(), y1+b1.Dy()), page1Img, b1.Min, draw.Over)
+		if t, ok := d.dualClickTarget(page1, 0, y1, b1.Dx(), y1+b1.Dy()); ok {
+			targets = append(targets, t)
+		}
 
 		if page2Img != nil {
 			b2 := page2Img.Bounds()
 			x2 := b1.Dx() + gap
 			y2 := (compositeH - b2.Dy()) / 2
 			draw.Draw(composite, image.Rect(x2, y2, x2+b2.Dx(), y2+b2.Dy()), page2Img, b2.Min, draw.Over)
+			if t, ok := d.dualClickTarget(page2, x2, y2, x2+b2.Dx(), y2+b2.Dy()); ok {
+				targets = append(targets, t)
+			}
 		}
 	}
 
@@ -531,6 +649,16 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 	horizontalOffset := (termWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
+	}
+
+	// Opt+click map: displayDualVertical/Horizontal position the cursor at
+	// row 1, column 1 before rendering. Clicks in the gap between the two
+	// page targets fall through to "no target" and are ignored.
+	d.clickMap = clickMap{
+		originCol: 1 + horizontalOffset, originRow: 1,
+		cols: imageWidthInChars, rows: actualLines,
+		pxW: float64(compositeW), pxH: float64(compositeH),
+		targets: targets,
 	}
 
 	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, compositeW, compositeH, termType)
@@ -668,6 +796,15 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
+
+	// Opt+click map: displayHalfPage positions the cursor at row 1, column 1.
+	// The displayed image shows the vertical band [cropY, cropY+cropH] of the
+	// full-page render (fullH px tall), narrowed by the user's outer-edge crop
+	// — that band expressed as page-height fractions is [fy0, fy1].
+	fy0 := (float64(cropY) + float64(cropH)*userTop) / float64(fullH)
+	fy1 := (float64(cropY) + float64(cropH)*(1-userBottom)) / float64(fullH)
+	d.setPageClickMap(pageNum, 1+horizontalOffset, 1, actualLines, imageWidthInChars,
+		finalW, finalH, d.cropLeft, 1-d.cropRight, fy0, fy1)
 
 	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, finalW, finalH, termType)
 }

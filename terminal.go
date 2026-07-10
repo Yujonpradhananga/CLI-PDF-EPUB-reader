@@ -304,6 +304,12 @@ const (
 	keyUncropBottom byte = 0xE3 // Cmd+Opt+Shift+] — inverse of '}'
 )
 
+// keyMouseAltClick is the synthetic key delivered when readSingleChar parses
+// an SGR mouse report for an Opt(Alt)+left button press. The clicked cell is
+// stored in d.mouseCol/d.mouseRow — a single returned byte can't carry
+// coordinates, so the viewer fields are the side channel to handleAltClick.
+const keyMouseAltClick byte = 0xE8
+
 // parseKittyCSIU parses the parameter bytes of a Kitty keyboard protocol
 // "CSI u" sequence (the part between "ESC [" and the final 'u', e.g. "91;11"
 // or with the optional shifted-key/event-type suffixes "91:97;11:2") and
@@ -319,6 +325,20 @@ func parseKittyCSIU(params []byte) (key int, mods int) {
 		mods = firstIntField(fields[1])
 	}
 	return key, mods
+}
+
+// parseSGRMouse parses the parameter bytes of an SGR mouse report (the part
+// between "ESC [ <" and the final 'M'/'m', e.g. "8;42;17") and returns the
+// button/modifier code and the 1-based cell column and row.
+func parseSGRMouse(params []byte) (btn, col, row int, ok bool) {
+	fields := strings.Split(string(params), ";")
+	if len(fields) != 3 {
+		return 0, 0, 0, false
+	}
+	btn = firstIntField(fields[0])
+	col = firstIntField(fields[1])
+	row = firstIntField(fields[2])
+	return btn, col, row, col > 0 && row > 0
 }
 
 // firstIntField parses the leading decimal digits of s, stopping at the
@@ -340,20 +360,27 @@ func firstIntField(s string) int {
 
 func (d *DocumentViewer) readSingleChar() byte {
 	buf := make([]byte, 1)
-	n, _ := os.Stdin.Read(buf)
-	if n == 0 {
-		return 0
-	}
+	b := make([]byte, 1)
+	// Loop: mouse reports that carry no action (plain clicks, wheel, releases)
+	// are consumed here and must not surface at all — even a synthetic 0 byte
+	// would trigger a redraw per event, and a wheel gesture emits dozens.
+	for {
+		n, _ := os.Stdin.Read(buf)
+		if n == 0 {
+			return 0
+		}
 
-	// Escape sequence handling. Arrow/function keys arrive in several shapes
-	// depending on terminal and mode: CSI (ESC [ ... final), SS3 (ESC O final),
-	// and with modifier params (ESC [ 1 ; 2 C). agterm/ghostty can use any of
-	// these. The key robustness rule: once we see an escape sequence we consume
-	// it WHOLE (up to its final byte 0x40-0x7E) and either map it to a known key
-	// or swallow it. We must never let leftover bytes ('[', ']', 'C', 'D', ...)
-	// flow back as commands, because those are destructive (crop / dark mode).
-	if buf[0] == 27 {
-		b := make([]byte, 1)
+		// Escape sequence handling. Arrow/function keys arrive in several shapes
+		// depending on terminal and mode: CSI (ESC [ ... final), SS3 (ESC O final),
+		// and with modifier params (ESC [ 1 ; 2 C). agterm/ghostty can use any of
+		// these. The key robustness rule: once we see an escape sequence we consume
+		// it WHOLE (up to its final byte 0x40-0x7E) and either map it to a known key
+		// or swallow it. We must never let leftover bytes ('[', ']', 'C', 'D', ...)
+		// flow back as commands, because those are destructive (crop / dark mode).
+		if buf[0] != 27 {
+			return buf[0]
+		}
+
 		n, _ = os.Stdin.Read(b)
 		if n != 1 {
 			return 27 // bare ESC
@@ -417,10 +444,35 @@ func (d *DocumentViewer) readSingleChar() byte {
 					}
 				}
 			}
+		case 'M', 'm': // mouse reports (enabled via ?1000h/?1006h in Run)
+			if len(params) > 0 && params[0] == '<' {
+				// SGR encoding: ESC [ < btn ; col ; row, final M=press m=release.
+				// btn bits: low 2 = button (0=left), +4 shift, +8 alt, +16 ctrl,
+				// +32 motion, 64/65 wheel. Only an unmodified Opt+left press
+				// (btn == 0|8 exactly) becomes a key; every other mouse event is
+				// consumed silently.
+				btn, col, row, ok := parseSGRMouse(params[1:])
+				if ok && final == 'M' && btn == 8 {
+					d.mouseMu.Lock()
+					d.mouseCol, d.mouseRow = col, row
+					d.mouseMu.Unlock()
+					return keyMouseAltClick
+				}
+				continue
+			}
+			if final == 'M' && len(params) == 0 {
+				// Legacy X10 mouse encoding (terminal ignored ?1006h): three raw
+				// payload bytes follow the final 'M'; consume them so they can't
+				// leak into the input stream as commands.
+				for i := 0; i < 3; i++ {
+					if n, _ = os.Stdin.Read(b); n != 1 {
+						break
+					}
+				}
+				continue
+			}
 		}
 		// Recognized escape sequence but not an arrow/known combo: swallow it.
 		return 0
 	}
-
-	return buf[0]
 }

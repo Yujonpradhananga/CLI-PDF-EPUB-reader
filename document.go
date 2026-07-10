@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"fmt"
 	"image"
@@ -10,10 +11,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gen2brain/go-fitz"
@@ -66,6 +69,17 @@ type DocumentViewer struct {
 	// terminal reads the file asynchronously (see saveEphemeralPNG).
 	ephemeralSeq      int
 	lastEphemeralPath string
+
+	// Opt+click inverse sync. clickMap records where the last-drawn page image
+	// sits on screen and how its pixels map back to PDF points (rebuilt by the
+	// image render paths on every display; see image.go). mouseCol/mouseRow
+	// carry the clicked cell from the stdin-reader goroutine to handleAltClick;
+	// the mutex matters because a second click can overwrite the fields before
+	// the first keyMouseAltClick byte is consumed from the input channel.
+	clickMap clickMap
+	mouseMu  sync.Mutex
+	mouseCol int
+	mouseRow int
 
 	// visualContent caches pageHasVisualContent per page number — the check
 	// renders the page, and getPageContentType runs it on every page display.
@@ -354,6 +368,32 @@ func (d *DocumentViewer) checkColorVariance(img image.Image) float64 {
 	return rVar + gVar + bVar
 }
 
+// Terminal-restore hook for external kills (SIGTERM/SIGHUP): defers don't run
+// then, and a shell left in mouse-reporting mode gets junk bytes on every
+// click. zsh repairs raw mode and the cursor, but never DECRST 1000/1006.
+var (
+	sigCleanupOnce sync.Once
+	sigRestoreMu   sync.Mutex
+	sigRestore     func()
+)
+
+func installSignalCleanup() {
+	sigCleanupOnce.Do(func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGHUP)
+		go func() {
+			<-ch
+			sigRestoreMu.Lock()
+			f := sigRestore
+			sigRestoreMu.Unlock()
+			if f != nil {
+				f()
+			}
+			os.Exit(1)
+		}()
+	})
+}
+
 func (d *DocumentViewer) Run() bool {
 	if d.doc != nil {
 		defer d.doc.Close()
@@ -398,7 +438,28 @@ func (d *DocumentViewer) Run() bool {
 	if d.detectTerminalType() == "kitty" {
 		fmt.Print("\x1b[>1u")
 		defer fmt.Print("\x1b[<u")
+		// SGR mouse reporting (button press/release only, no motion) for the
+		// Opt+click synctex jump. The click→cell mapping relies on the kitty
+		// graphics c/r cell placement, so this stays kitty-gated too.
+		// readSingleChar consumes every other mouse event silently.
+		fmt.Print("\x1b[?1000h\x1b[?1006h")
+		defer fmt.Print("\x1b[?1006l\x1b[?1000l")
 	}
+
+	installSignalCleanup()
+	sigRestoreMu.Lock()
+	sigRestore = func() {
+		fmt.Print("\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?25h")
+		if d.oldState != nil {
+			term.Restore(int(os.Stdin.Fd()), d.oldState)
+		}
+	}
+	sigRestoreMu.Unlock()
+	defer func() {
+		sigRestoreMu.Lock()
+		sigRestore = nil
+		sigRestoreMu.Unlock()
+	}()
 
 	d.currentPage = 0
 
@@ -805,6 +866,10 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		d.openInExternalApp("Skim")
 	case 'P':
 		d.openInExternalApp("Preview")
+	case 'v':
+		d.syncToVim()
+	case keyMouseAltClick: // Opt+left click — synctex jump at the clicked point
+		d.handleAltClick()
 	case 'O':
 		absPath, _ := filepath.Abs(d.path)
 		exec.Command("open", "-R", absPath).Start()
@@ -898,6 +963,99 @@ end tell
 	case "Preview":
 		exec.Command("open", "-a", appName, absPath).Start()
 	}
+}
+
+// handleAltClick maps the last Opt+click (cell coordinates stored by
+// readSingleChar) through the current clickMap to a point on a PDF page and
+// asks synctex which source line produced it. Clicks outside the displayed
+// image — or on a text page, which has no map — are ignored.
+func (d *DocumentViewer) handleAltClick() {
+	d.mouseMu.Lock()
+	col, row := d.mouseCol, d.mouseRow
+	// Consume the coordinates: a stray 0xE8 byte (e.g. a pasted UTF-8 lead
+	// byte) then maps through (0,0) and is rejected instead of replaying the
+	// previous click.
+	d.mouseCol, d.mouseRow = 0, 0
+	d.mouseMu.Unlock()
+	page0, x, y, ok := d.clickMap.cellToPDF(col, row)
+	if !ok {
+		return
+	}
+	d.syncToVimAt(page0, x, y)
+}
+
+// syncToVim ('v' key): inverse sync at the center of the current page.
+func (d *DocumentViewer) syncToVim() {
+	if d.doc == nil || len(d.textPages) == 0 {
+		return
+	}
+	pdfPage := d.textPages[d.currentPage] // 0-indexed PDF page on screen
+
+	// Center of the page, in PDF points (top-left origin, what synctex wants).
+	x, y := 306.0, 396.0 // US-Letter center fallback
+	if r, err := d.doc.Bound(pdfPage); err == nil {
+		x = float64(r.Dx()) / 2
+		y = float64(r.Dy()) / 2
+	}
+	d.syncToVimAt(pdfPage, x, y)
+}
+
+// syncToVimAt performs inverse sync (docviewer -> editor): asks synctex which
+// source file/line produced the point (x, y) — PDF points, top-left origin —
+// on the 0-indexed page page0, then hands (file, line) to
+// ~/.vim/docviewer-to-vim.sh, which drives the vim session in agterm. Mirrors
+// DocViewerForwardSync in vimrc.d/latex.vim.
+func (d *DocumentViewer) syncToVimAt(page0 int, x, y float64) {
+	if d.doc == nil || len(d.textPages) == 0 {
+		return
+	}
+	absPath, err := filepath.Abs(d.path)
+	if err != nil {
+		return
+	}
+	page := page0 + 1 // synctex is 1-indexed
+
+	// Off the main loop: a book-sized .synctex.gz can take a while to query
+	// and must not stall input or redraws. Only locals are captured.
+	go func() {
+		synctexBin := "/Library/TeX/texbin/synctex"
+		if _, err := os.Stat(synctexBin); err != nil {
+			synctexBin = "synctex" // fall back to PATH
+		}
+		query := fmt.Sprintf("%d:%.2f:%.2f:%s", page, x, y, absPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, synctexBin, "edit", "-o", query).Output()
+		if err != nil {
+			return
+		}
+		var srcFile string
+		var line int
+		for _, ln := range strings.Split(string(out), "\n") {
+			switch {
+			case strings.HasPrefix(ln, "Input:"):
+				if srcFile == "" {
+					srcFile = strings.TrimSpace(strings.TrimPrefix(ln, "Input:"))
+				}
+			case strings.HasPrefix(ln, "Line:"):
+				if line == 0 {
+					line, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "Line:")))
+				}
+			}
+		}
+		if srcFile == "" || line <= 0 {
+			return
+		}
+		// synctex may report the source relative to the PDF's directory
+		if !filepath.IsAbs(srcFile) {
+			srcFile = filepath.Join(filepath.Dir(absPath), srcFile)
+		}
+		// Run (not Start) so the child is reaped — we're already off the
+		// main loop, and the script drives vim/agterm on its own.
+		home, _ := os.UserHomeDir()
+		exec.Command(filepath.Join(home, ".vim", "docviewer-to-vim.sh"),
+			srcFile, strconv.Itoa(line)).Run()
+	}()
 }
 
 func (d *DocumentViewer) startSearch(inputChan <-chan byte) {
