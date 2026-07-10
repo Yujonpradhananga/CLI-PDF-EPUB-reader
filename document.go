@@ -630,11 +630,13 @@ func (d *DocumentViewer) setFlash(page0 int, x, y float64) {
 	d.flash = flashState{active: true, page0: page0, x: x, y: y}
 }
 
-// rollHalfToSyncPoint switches the half-page view to the half that contains
-// the forward-synced point, mirroring renderHalfPage's bands: the top half
-// shows the first ~55% of the page, the bottom half the last ~55%. A point
-// in the 45–55% overlap is visible in either half, so the current one is
-// kept. No-op outside half-page mode.
+// rollHalfToSyncPoint switches the half-page view to the half that contains the
+// forward-synced point, using the bands each half actually shows (halfPageBands:
+// ~55% of the page each, less whatever the user's outer-edge crop trims). A
+// point in the overlap is visible in either half, so the current one is kept; a
+// point trimmed off both halves picks the half whose uncropped band holds it, so
+// the marker at least lands on the right side of the page. No-op outside
+// half-page mode.
 func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
 	if d.dualPageMode != "half" || d.doc == nil {
 		return
@@ -643,11 +645,27 @@ func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
 	if err != nil || r.Dy() <= 0 {
 		return
 	}
+	_, termHeight := d.getTerminalSize()
+	topY0, topY1, botY0, botY1, ok := d.halfPageBands(page0, termHeight)
+	if !ok {
+		return
+	}
+
 	fy := y / float64(r.Dy())
-	if fy > 0.55 {
-		d.halfPageOffset = 1
-	} else if fy < 0.45 {
+	inTop := fy >= topY0 && fy <= topY1
+	inBottom := fy >= botY0 && fy <= botY1
+
+	switch {
+	case inTop && inBottom:
+		// overlap: whichever half is showing already displays the point
+	case inTop:
 		d.halfPageOffset = 0
+	case inBottom:
+		d.halfPageOffset = 1
+	case fy <= topY1:
+		d.halfPageOffset = 0
+	default:
+		d.halfPageOffset = 1
 	}
 }
 

@@ -319,9 +319,17 @@ func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, image
 		}
 	}
 
-	// Draw markers on the right edge
+	// Draw markers in the margin column just right of the image (like
+	// drawFlashMarker), falling back to the terminal edge if no click map.
+	col := termWidth
+	if d.clickMap.cols > 0 {
+		col = d.clickMap.originCol + d.clickMap.cols
+		if col > termWidth {
+			col = termWidth
+		}
+	}
 	for row := range markerRows {
-		fmt.Printf("\033[%d;%dH", row, termWidth)
+		fmt.Printf("\033[%d;%dH", row, col)
 		fmt.Print("\033[43m \033[0m") // yellow block
 	}
 }

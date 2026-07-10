@@ -709,6 +709,62 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, compositeW, compositeH, termType)
 }
 
+// halfPageDPI is the render DPI for half-page mode: chosen so that 55% of the
+// page height fills termHeight exactly, then clamped to what the terminal can
+// usefully display. The page box in points equals pixels at 72 DPI, so this
+// avoids a throwaway full render just to measure.
+func (d *DocumentViewer) halfPageDPI(pageHeightAt72 float64, termHeight int, termType string, pixelsPerLine float64) float64 {
+	targetFullPixels := float64(termHeight) * pixelsPerLine / 0.55
+
+	scale := d.scaleFactor
+	if scale == 0 {
+		scale = 1.0
+	}
+	dpi := targetFullPixels / pageHeightAt72 * 72.0 * scale
+
+	if dpi < 36 {
+		dpi = 36
+	}
+	maxDPI := 300.0
+	if termType != "kitty" {
+		maxDPI = 100.0
+	}
+	if dpi > maxDPI {
+		dpi = maxDPI
+	}
+	return dpi
+}
+
+// halfPageBands returns the vertical bands of page pageNum that the two halves
+// actually show, as fractions of the full page height, mirroring renderHalfPage:
+// each half covers cropFrac of the page (55%, or more when a clamped DPI leaves
+// the render too short to fill termHeight), anchored to its outer edge, with the
+// user's outer-edge crop trimmed off. rollHalfToSyncPoint needs these to decide
+// which half a synctex point lands in.
+func (d *DocumentViewer) halfPageBands(pageNum, termHeight int) (topY0, topY1, botY0, botY1 float64, ok bool) {
+	if termHeight <= 0 || d.doc == nil {
+		return 0, 0, 0, 0, false
+	}
+	r, err := d.doc.Bound(pageNum)
+	if err != nil || r.Dy() <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	_, pixelsPerLine := d.getTerminalCellSize()
+	dpi := d.halfPageDPI(float64(r.Dy()), termHeight, d.detectTerminalType(), pixelsPerLine)
+	fullH := float64(r.Dy()) * dpi / 72.0
+	if fullH <= 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	cropFrac := 0.55
+	if want := float64(termHeight) * pixelsPerLine / fullH; want > cropFrac && want <= 1 {
+		cropFrac = want
+	}
+
+	return cropFrac * d.cropTop, cropFrac,
+		1 - cropFrac, 1 - cropFrac*d.cropBottom, true
+}
+
 // renderHalfPage renders only the top or bottom 55% of a page, scaled to fill the terminal.
 // isBottom=false shows top 55%, isBottom=true shows bottom 55%.
 func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBottom bool) int {
@@ -754,25 +810,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 			return 0
 		}
 
-		targetCropPixels := float64(termHeight) * pixelsPerLine
-		targetFullPixels := targetCropPixels / 0.55
-
-		scale := d.scaleFactor
-		if scale == 0 {
-			scale = 1.0
-		}
-		dpi := targetFullPixels / float64(pageHeightAt72) * 72.0 * scale
-
-		if dpi < 36 {
-			dpi = 36
-		}
-		maxDPI := 300.0
-		if termType != "kitty" {
-			maxDPI = 100.0
-		}
-		if dpi > maxDPI {
-			dpi = maxDPI
-		}
+		dpi := d.halfPageDPI(float64(pageHeightAt72), termHeight, termType, pixelsPerLine)
 
 		rawImg, err := d.doc.ImageDPI(pageNum, dpi)
 		if err != nil {
