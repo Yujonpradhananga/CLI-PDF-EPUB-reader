@@ -87,7 +87,12 @@ type DocumentViewer struct {
 	// mapped row. It persists across redraws (reload, zoom, crop) while the
 	// synced page stays on screen; paging away clears it, and the next jump
 	// replaces it. Main-goroutine-only, like clickMap.
-	flash flashState
+	//
+	// The rule across the page is transient: flashUntil bounds its life, and
+	// flashRuleID is the kitty image id of the placement currently on screen.
+	flash       flashState
+	flashUntil  time.Time
+	flashRuleID uint32
 
 	// visualContent caches pageHasVisualContent per page number — the check
 	// renders the page, and getPageContentType runs it on every page display.
@@ -483,6 +488,16 @@ func (d *DocumentViewer) Run() bool {
 	// (see startReloadRender); the main loop then redraws as a cache hit.
 	reloadRenderChan := make(chan struct{}, 1)
 
+	// Signaled flashRuleWindow after a forward-sync jump, so the rule across
+	// the page comes down without waiting for the reader to press a key.
+	flashChan := make(chan struct{}, 1)
+	var flashTimer *time.Timer
+	defer func() {
+		if flashTimer != nil {
+			flashTimer.Stop()
+		}
+	}()
+
 	// Set up FIFO for external control
 	d.setupFIFO()
 	defer d.cleanupFIFO()
@@ -534,8 +549,20 @@ func (d *DocumentViewer) Run() bool {
 			if t.hasPoint {
 				d.setFlash(t.page-1, t.x, t.y)
 				d.rollHalfToSyncPoint(t.page-1, t.y)
+				if flashTimer != nil {
+					flashTimer.Stop()
+				}
+				flashTimer = time.AfterFunc(flashRuleWindow, func() {
+					select {
+					case flashChan <- struct{}{}:
+					default:
+					}
+				})
 			}
 			d.displayCurrentPage()
+		case <-flashChan:
+			d.clearFlashRule()
+			os.Stdout.Sync()
 		case <-ticker.C:
 			if d.checkAndReload() {
 				d.startReloadRender(reloadRenderChan)
@@ -618,17 +645,22 @@ type syncTarget struct {
 
 // flashState records the current forward-sync marker. page0/x/y locate the
 // synctex point (PDF points, top-left origin). The marker persists until its
-// page leaves the screen (see drawFlashMarker) or the next jump replaces it.
+// page leaves the screen (see drawFlash) or the next jump replaces it.
 type flashState struct {
 	active bool
 	page0  int
 	x, y   float64
 }
 
+// flashRuleWindow is how long the rule across the page stays up after a jump;
+// the margin markers outlive it.
+const flashRuleWindow = 3 * time.Second
+
 // setFlash records the forward-sync marker for the jump being processed.
 // Main goroutine only.
 func (d *DocumentViewer) setFlash(page0 int, x, y float64) {
 	d.flash = flashState{active: true, page0: page0, x: x, y: y}
+	d.flashUntil = time.Now().Add(flashRuleWindow)
 }
 
 // chooseHalf picks the half-page offset (0 top, 1 bottom) that best shows the

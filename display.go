@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -38,7 +39,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	if d.dualPageMode == "half" {
 		d.displayHalfPage(termWidth, termHeight)
-		d.drawFlashMarker(termWidth)
+		d.drawFlash(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -46,7 +47,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	}
 	if d.dualPageMode != "" {
 		d.displayDualPage(termWidth, termHeight)
-		d.drawFlashMarker(termWidth)
+		d.drawFlash(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -64,7 +65,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	default:
 		d.displayTextPage(actualPage, termWidth, termHeight)
 	}
-	d.drawFlashMarker(termWidth)
+	d.drawFlash(termWidth)
 	fmt.Print("\033[9999;1H")
 
 	// Warm neighbor pages in the background so sequential reading is instant.
@@ -322,7 +323,7 @@ func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, image
 	}
 
 	// Draw markers in the margin column just right of the image (like
-	// drawFlashMarker), falling back to the terminal edge if no click map.
+	// drawFlash), falling back to the terminal edge if no click map.
 	col := termWidth
 	if d.clickMap.cols > 0 {
 		col = d.clickMap.originCol + d.clickMap.cols
@@ -336,26 +337,35 @@ func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, image
 	}
 }
 
-// drawFlashMarker paints the forward-sync marker recorded by setFlash, using
-// the clickMap the render path above just rebuilt: bold red ▶ / ◀ in the
-// margin columns immediately left and right of the image at the target row.
-// Like drawSearchMarkers, it draws beside the image rather than over it:
-// kittySendPNG places images at z-index 0, which the kitty graphics protocol
-// stacks above text, so a glyph at the target cell itself would be covered.
+// drawFlash paints the forward-sync marker recorded by setFlash, using the
+// clickMap the render path above just rebuilt: bold red ▶ / ◀ in the margin
+// columns immediately left and right of the image at the target row, plus a
+// thin red rule across the page at that row for the first flashRuleWindow
+// after the jump.
+//
+// Like drawSearchMarkers, the margin glyphs draw beside the image rather than
+// over it: kittySendPNG places pages at z-index 0, which the kitty graphics
+// protocol stacks above text, so a glyph at the target cell itself would be
+// covered. The rule instead goes over the page as its own graphics placement
+// at z=1, which is why it exists only on kitty-protocol terminals.
+//
 // The marker persists across redraws (reload, zoom, crop) while its page is
 // on screen; once the page is no longer displayed it is cleared for good. A
 // point on a displayed page that is itself hidden (cropped off, other half in
 // half-page mode) keeps the marker armed without drawing.
-func (d *DocumentViewer) drawFlashMarker(termWidth int) {
+func (d *DocumentViewer) drawFlash(termWidth int) {
 	if !d.flash.active {
+		d.clearFlashRule()
 		return
 	}
 	if !d.clickMap.hasPage(d.flash.page0) {
 		d.flash = flashState{}
+		d.clearFlashRule()
 		return
 	}
 	_, row, ok := d.clickMap.pdfToCell(d.flash.page0, d.flash.x, d.flash.y)
 	if !ok {
+		d.clearFlashRule()
 		return
 	}
 	leftCol := d.clickMap.originCol - 1
@@ -368,6 +378,36 @@ func (d *DocumentViewer) drawFlashMarker(termWidth int) {
 	}
 	fmt.Printf("\033[%d;%dH\033[1;31m▶\033[0m", row, leftCol)
 	fmt.Printf("\033[%d;%dH\033[1;31m◀\033[0m", row, rightCol)
+	d.drawFlashRule(row)
+}
+
+// drawFlashRule places the thin overlay line across the image at the given
+// row, replacing any previous placement. A page image drawn after the last
+// rule would sit under it forever, so every redraw re-places (or drops) it.
+func (d *DocumentViewer) drawFlashRule(row int) {
+	d.clearFlashRule()
+	if time.Now().After(d.flashUntil) || d.detectTerminalType() != "kitty" {
+		return
+	}
+	path, err := syncRulePNG(d.tempDir)
+	if err != nil {
+		return
+	}
+	id := nextKittyImageID()
+	fmt.Printf("\033[%d;%dH", row, d.clickMap.originCol)
+	if err := kittySendPNG(path, id, d.clickMap.cols, 1, 1); err != nil {
+		return
+	}
+	d.flashRuleID = id
+}
+
+// clearFlashRule removes the overlay line from the screen if one is placed.
+func (d *DocumentViewer) clearFlashRule() {
+	if d.flashRuleID == 0 {
+		return
+	}
+	kittyDeleteImage(d.flashRuleID)
+	d.flashRuleID = 0
 }
 
 // statusIndicators returns the trailing indicator group shared by every status

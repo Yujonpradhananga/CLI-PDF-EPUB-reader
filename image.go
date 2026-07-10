@@ -902,7 +902,7 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 	// RGBA base64 — tens of MB through the PTY per page display in agterm/ghostty.
 	if termType == "kitty" {
 		newID := nextKittyImageID()
-		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines); err != nil {
+		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines, 0); err != nil {
 			return 0
 		}
 		// Flicker-free swap: the new image was just placed over the old one, so
