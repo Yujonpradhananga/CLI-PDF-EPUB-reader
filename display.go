@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 func (d *DocumentViewer) displayCurrentPage() {
@@ -368,11 +370,9 @@ func (d *DocumentViewer) drawFlashMarker(termWidth int) {
 	fmt.Printf("\033[%d;%dH\033[1;31m◀\033[0m", row, rightCol)
 }
 
-func (d *DocumentViewer) displayPageInfo(pageNum, termWidth int, contentType string) {
-	modeIndicator := ""
-	if d.forceMode != "" {
-		modeIndicator = fmt.Sprintf(" [%s]", d.forceMode)
-	}
+// statusIndicators returns the trailing indicator group shared by every status
+// bar: fit, zoom, dark mode, crop, search, and the file type.
+func (d *DocumentViewer) statusIndicators() string {
 	fitIndicator := fmt.Sprintf(" [fit:%s]", d.fitMode)
 	scaleIndicator := ""
 	if d.isReflowable {
@@ -401,22 +401,60 @@ func (d *DocumentViewer) displayPageInfo(pageNum, termWidth int, contentType str
 			searchIndicator = fmt.Sprintf(" [/%s: no matches]", d.searchQuery)
 		}
 	}
-	typeLabel := strings.ToUpper(d.fileType)
-	pageInfo := fmt.Sprintf("Page %d/%d (%s)%s%s%s%s%s%s - %s", d.currentPage+1, len(d.textPages), contentType, modeIndicator, fitIndicator, scaleIndicator, darkIndicator, cropIndicator, searchIndicator, typeLabel)
-	if len(pageInfo) > termWidth {
-		pageInfo = pageInfo[:termWidth-3] + "..."
+	return fmt.Sprintf("%s%s%s%s%s - %s",
+		fitIndicator, scaleIndicator, darkIndicator, cropIndicator, searchIndicator,
+		strings.ToUpper(d.fileType))
+}
+
+// drawStatusBar writes the centered status line at the cursor: the file name,
+// then the caller's position and mode text. When the line does not fit, the
+// name is elided first — where you are in the file matters more than seeing the
+// whole name. Widths count runes, since file names need not be ASCII.
+func (d *DocumentViewer) drawStatusBar(termWidth int, body string) {
+	if termWidth <= 0 {
+		return
 	}
-	if len(pageInfo) < termWidth {
-		padding := (termWidth - len(pageInfo)) / 2
-		fmt.Printf("%s%s", strings.Repeat(" ", padding), pageInfo)
+	line := body
+	if name := filepath.Base(d.path); name != "." && name != string(filepath.Separator) {
+		if room := termWidth - utf8.RuneCountInString(body) - 3; room >= 4 {
+			if r := []rune(name); len(r) > room {
+				name = string(r[:room-1]) + "…"
+			}
+			line = name + " · " + body
+		}
+	}
+	n := utf8.RuneCountInString(line)
+	if n > termWidth {
+		line = string([]rune(line)[:termWidth])
 	} else {
-		fmt.Print(pageInfo)
+		line = strings.Repeat(" ", (termWidth-n)/2) + line
 	}
+	fmt.Print(line)
+}
+
+func (d *DocumentViewer) displayPageInfo(pageNum, termWidth int, contentType string) {
+	modeIndicator := ""
+	if d.forceMode != "" {
+		modeIndicator = fmt.Sprintf(" [%s]", d.forceMode)
+	}
+	d.drawStatusBar(termWidth, fmt.Sprintf("Page %d/%d (%s)%s%s",
+		d.currentPage+1, len(d.textPages), contentType, modeIndicator, d.statusIndicators()))
+}
+
+// halfPageViewHeight is the number of rows the half-page image may use: the
+// terminal minus the status bar. rollHalfToSyncPoint must agree with
+// displayHalfPage on this, because the render DPI — and hence which band of the
+// page each half shows — is derived from it.
+func halfPageViewHeight(termHeight int) int {
+	if termHeight <= 1 {
+		return termHeight
+	}
+	return termHeight - 1
 }
 
 func (d *DocumentViewer) displayHalfPage(termWidth, termHeight int) {
 	pageNum := d.textPages[d.currentPage]
-	availableHeight := termHeight
+	availableHeight := halfPageViewHeight(termHeight)
 	isBottom := d.halfPageOffset == 1
 
 	fmt.Print("\033[1;1H")
@@ -425,6 +463,15 @@ func (d *DocumentViewer) displayHalfPage(termWidth, termHeight int) {
 		fmt.Print("\033[1;1H")
 		fmt.Printf("  [Render failed]")
 	}
+
+	// Status bar
+	fmt.Printf("\033[%d;1H", termHeight)
+	half := "top"
+	if isBottom {
+		half = "bottom"
+	}
+	d.drawStatusBar(termWidth, fmt.Sprintf("Page %d/%d (%s half) [half]%s",
+		d.currentPage+1, len(d.textPages), half, d.statusIndicators()))
 }
 
 func (d *DocumentViewer) reflowText(text string, termWidth int) []string {
@@ -729,45 +776,5 @@ func (d *DocumentViewer) displayDualPageInfo(hasPage2 bool, termWidth int, modeL
 		pageRange = fmt.Sprintf("Page %d/%d", page1Num, totalPages)
 	}
 
-	fitIndicator := fmt.Sprintf(" [fit:%s]", d.fitMode)
-	scaleIndicator := ""
-	if d.isReflowable {
-		zoomPct := 595 * 100 / d.htmlPageWidth
-		scaleIndicator = fmt.Sprintf(" [zoom:%d%%]", zoomPct)
-	} else if d.scaleFactor != 1.0 {
-		scaleIndicator = fmt.Sprintf(" [%.0f%%]", d.scaleFactor*100)
-	}
-	darkIndicator := ""
-	switch d.darkMode {
-	case "smart":
-		darkIndicator = " [dark]"
-	case "invert":
-		darkIndicator = " [dark:inv]"
-	}
-	cropIndicator := ""
-	if d.cropTop > 0 || d.cropBottom > 0 || d.cropLeft > 0 || d.cropRight > 0 {
-		cropIndicator = " [crop]"
-	}
-	searchIndicator := ""
-	if d.searchQuery != "" {
-		if len(d.searchHits) > 0 {
-			searchIndicator = fmt.Sprintf(" [/%s: %d/%d]", d.searchQuery, d.searchHitIdx+1, len(d.searchHits))
-		} else {
-			searchIndicator = fmt.Sprintf(" [/%s: no matches]", d.searchQuery)
-		}
-	}
-
-	typeLabel := strings.ToUpper(d.fileType)
-	pageInfo := fmt.Sprintf("%s (Image) [%s]%s%s%s%s%s - %s",
-		pageRange, modeLabel, fitIndicator, scaleIndicator, darkIndicator, cropIndicator, searchIndicator, typeLabel)
-
-	if len(pageInfo) > termWidth {
-		pageInfo = pageInfo[:termWidth-3] + "..."
-	}
-	if len(pageInfo) < termWidth {
-		padding := (termWidth - len(pageInfo)) / 2
-		fmt.Printf("%s%s", strings.Repeat(" ", padding), pageInfo)
-	} else {
-		fmt.Print(pageInfo)
-	}
+	d.drawStatusBar(termWidth, fmt.Sprintf("%s (Image) [%s]%s", pageRange, modeLabel, d.statusIndicators()))
 }

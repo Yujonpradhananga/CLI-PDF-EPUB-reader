@@ -676,7 +676,7 @@ func (d *DocumentViewer) rollHalfToSyncPoint(page0 int, y float64) {
 		return
 	}
 	_, termHeight := d.getTerminalSize()
-	topY0, topY1, botY0, botY1, ok := d.halfPageBands(page0, termHeight)
+	topY0, topY1, botY0, botY1, ok := d.halfPageBands(page0, halfPageViewHeight(termHeight))
 	if !ok {
 		return
 	}
