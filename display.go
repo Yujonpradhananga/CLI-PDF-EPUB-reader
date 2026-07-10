@@ -15,13 +15,6 @@ func (d *DocumentViewer) displayCurrentPage() {
 	// paths below rebuild it (text pages leave it cleared, so clicks no-op).
 	d.clickMap = clickMap{}
 
-	// The redraw AFTER the one that painted the flash marker dismisses it —
-	// any keypress, page turn, reload, or the expiry itself. Only the sync
-	// jump's own redraw (flash set but not yet drawn) paints the marker.
-	if d.flash.drawn {
-		d.flash = flashState{}
-	}
-
 	// Begin synchronized update (Kitty) - buffers output for atomic display
 	fmt.Print("\033[?2026h")
 
@@ -333,20 +326,24 @@ func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, image
 	}
 }
 
-// drawFlashMarker paints the forward-sync flash indicator recorded by
-// setFlash, using the clickMap the render path above just rebuilt: bold red
-// ▶ / ◀ in the margin columns immediately left and right of the image at the
-// target row. Like drawSearchMarkers, it draws beside the image rather than
-// over it: kittySendPNG places images at z-index 0, which the kitty graphics
-// protocol stacks above text, so a glyph at the target cell itself would be
-// covered. Marks the flash as drawn so the next redraw dismisses it; when the
-// point maps to no on-screen cell (page turned away, cropped off, text page)
-// the flash is spent without drawing anything.
+// drawFlashMarker paints the forward-sync marker recorded by setFlash, using
+// the clickMap the render path above just rebuilt: bold red ▶ / ◀ in the
+// margin columns immediately left and right of the image at the target row.
+// Like drawSearchMarkers, it draws beside the image rather than over it:
+// kittySendPNG places images at z-index 0, which the kitty graphics protocol
+// stacks above text, so a glyph at the target cell itself would be covered.
+// The marker persists across redraws (reload, zoom, crop) while its page is
+// on screen; once the page is no longer displayed it is cleared for good. A
+// point on a displayed page that is itself hidden (cropped off, other half in
+// half-page mode) keeps the marker armed without drawing.
 func (d *DocumentViewer) drawFlashMarker(termWidth int) {
 	if !d.flash.active {
 		return
 	}
-	d.flash.drawn = true
+	if !d.clickMap.hasPage(d.flash.page0) {
+		d.flash = flashState{}
+		return
+	}
 	_, row, ok := d.clickMap.pdfToCell(d.flash.page0, d.flash.x, d.flash.y)
 	if !ok {
 		return

@@ -81,14 +81,12 @@ type DocumentViewer struct {
 	mouseCol int
 	mouseRow int
 
-	// Forward-sync flash marker (\lv in vim): a control-file jump that carries
-	// a synctex point (see parseSyncCommand) flashes a margin marker at the
-	// mapped row for flashDuration. Main-goroutine-only, like clickMap: the Run
-	// loop sets and clears flash, and the expiry goroutine armed in setFlash
-	// only sends its seq back over a channel. flashSeq outlives individual
-	// flashes so an expiry for an already-cleared flash is recognized as stale.
-	flash    flashState
-	flashSeq int
+	// Forward-sync marker (\lv in vim): a control-file jump that carries a
+	// synctex point (see parseSyncCommand) draws a margin marker at the
+	// mapped row. It persists across redraws (reload, zoom, crop) while the
+	// synced page stays on screen; paging away clears it, and the next jump
+	// replaces it. Main-goroutine-only, like clickMap.
+	flash flashState
 
 	// visualContent caches pageHasVisualContent per page number — the check
 	// renders the page, and getPageContentType runs it on every page display.
@@ -480,12 +478,6 @@ func (d *DocumentViewer) Run() bool {
 	// Channel for external forward-sync commands via the control file
 	syncChan := make(chan syncTarget, 1)
 
-	// Flash-marker expiry: the goroutine armed in setFlash sends its seq here
-	// after flashDuration; seqs from an already-replaced or cleared flash are
-	// ignored. Buffered past 1 so a stale seq sitting unread can't make a
-	// newer expiry drop its (non-blocking) send.
-	flashExpiryChan := make(chan int, 4)
-
 	// Signaled when a background post-reload render has warmed the cache
 	// (see startReloadRender); the main loop then redraws as a cache hit.
 	reloadRenderChan := make(chan struct{}, 1)
@@ -537,16 +529,11 @@ func (d *DocumentViewer) Run() bool {
 			d.displayCurrentPage()
 		case t := <-syncChan:
 			d.jumpToPage(t.page)
-			d.flash = flashState{} // a jump without a point dismisses any pending flash
+			d.flash = flashState{} // a jump without a point dismisses any current marker
 			if t.hasPoint {
-				d.setFlash(t.page-1, t.x, t.y, flashExpiryChan)
+				d.setFlash(t.page-1, t.x, t.y)
 			}
 			d.displayCurrentPage()
-		case seq := <-flashExpiryChan:
-			if d.flash.active && d.flash.seq == seq {
-				d.flash = flashState{}
-				d.displayCurrentPage()
-			}
 		case <-ticker.C:
 			if d.checkAndReload() {
 				d.startReloadRender(reloadRenderChan)
@@ -627,38 +614,19 @@ type syncTarget struct {
 	hasPoint bool
 }
 
-// flashState records a pending forward-sync flash marker. page0/x/y locate
-// the synctex point (PDF points, top-left origin); seq matches the expiry
-// goroutine's send against the flash it was armed for; drawn tracks whether
-// the jump's own redraw has painted the marker yet, so any LATER redraw
-// (keypress, reload, expiry) clears it instead of repainting.
+// flashState records the current forward-sync marker. page0/x/y locate the
+// synctex point (PDF points, top-left origin). The marker persists until its
+// page leaves the screen (see drawFlashMarker) or the next jump replaces it.
 type flashState struct {
 	active bool
 	page0  int
 	x, y   float64
-	seq    int
-	drawn  bool
 }
 
-// flashDuration is how long the forward-sync marker stays on screen before
-// the expiry redraw removes it.
-const flashDuration = 1500 * time.Millisecond
-
-// setFlash records a flash target for the page jump being processed and arms
-// its expiry: after flashDuration the goroutine sends seq to expireChan and
-// the Run loop clears the flash if it is still the current one. Main
-// goroutine only.
-func (d *DocumentViewer) setFlash(page0 int, x, y float64, expireChan chan<- int) {
-	d.flashSeq++
-	d.flash = flashState{active: true, page0: page0, x: x, y: y, seq: d.flashSeq}
-	seq := d.flashSeq
-	go func() {
-		time.Sleep(flashDuration)
-		select {
-		case expireChan <- seq:
-		default:
-		}
-	}()
+// setFlash records the forward-sync marker for the jump being processed.
+// Main goroutine only.
+func (d *DocumentViewer) setFlash(page0 int, x, y float64) {
+	d.flash = flashState{active: true, page0: page0, x: x, y: y}
 }
 
 // parseSyncCommand parses one control-file command written by vim's forward

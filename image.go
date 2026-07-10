@@ -123,6 +123,17 @@ func (m *clickMap) cellToPDF(col, row int) (page0 int, x, y float64, ok bool) {
 	return 0, 0, 0, false
 }
 
+// hasPage reports whether the given 0-indexed PDF page is among the pages the
+// current clickMap covers, i.e. is displayed on screen right now.
+func (m *clickMap) hasPage(page0 int) bool {
+	for _, t := range m.targets {
+		if t.page0 == page0 {
+			return true
+		}
+	}
+	return false
+}
+
 // pdfToCell maps (page0, x, y) — PDF points, top-left origin — to the 1-based
 // terminal cell showing that point: the inverse of cellToPDF, walking the same
 // targets, crop fractions, and cell box. ok is false when the map is empty
