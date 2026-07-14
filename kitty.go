@@ -143,6 +143,19 @@ func kittyDeleteImage(id uint32) {
 	fmt.Printf("\x1b_Ga=d,d=I,i=%d\x1b\\", id)
 }
 
+// clearKittyGraphics removes every placement owned by this viewer. Redraws
+// delete the previous page as they swap in its replacement, but the final page
+// has no successor to trigger that deletion. Leaving it behind lets a z=0
+// placement cover parts of whatever the terminal draws after docviewer exits.
+func (d *DocumentViewer) clearKittyGraphics() {
+	d.clearFlashRule()
+	if d.lastKittyImageID == 0 {
+		return
+	}
+	kittyDeleteImage(d.lastKittyImageID)
+	d.lastKittyImageID = 0
+}
+
 // syncRulePNG writes (once) the overlay drawn across the page at a forward-sync
 // row: a translucent red band in the middle of an otherwise transparent tile.
 // The tile is stretched to cols x 1 cells on placement, so its width is

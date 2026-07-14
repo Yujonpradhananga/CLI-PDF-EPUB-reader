@@ -497,6 +497,7 @@ func (d *DocumentViewer) Run() bool {
 	sigRestoreMu.Lock()
 	sigRestore = func() {
 		fmt.Print("\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?25h\x1b]2;\x07")
+		d.clearKittyGraphics()
 		d.agterm.close()
 		if d.oldState != nil {
 			term.Restore(int(os.Stdin.Fd()), d.oldState)
@@ -665,6 +666,7 @@ func (d *DocumentViewer) startReloadRender(ch chan<- struct{}) {
 }
 
 func (d *DocumentViewer) cleanup() {
+	d.clearKittyGraphics()
 	if d.tempDir != "" {
 		os.RemoveAll(d.tempDir)
 	}
