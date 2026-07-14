@@ -109,7 +109,7 @@ type DocumentViewer struct {
 	linksGen  int
 	linksMu   sync.Mutex
 
-	// Browser-style jump history (Cmd+Left / Cmd+Right). Entries hold PDF
+	// Browser-style jump history (Ctrl+I / Ctrl+O). Entries hold PDF
 	// pages rather than textPages indices so they survive reloads. A link
 	// follow or forward-sync jump pushes onto backStack and clears fwdStack;
 	// historyBack/historyForward move between the stacks. Main-thread only.
@@ -578,7 +578,7 @@ func (d *DocumentViewer) Run() bool {
 			d.displayCurrentPage()
 		case t := <-syncChan:
 			// Any sync jump — vim forward sync or a followed link — is a
-			// navigation: record where we were for Cmd+Left. A jump that
+			// navigation: record where we were for Ctrl+I. A jump that
 			// lands where it started leaves a stale top entry, which
 			// historyBack skips.
 			d.pushHistory()
@@ -850,7 +850,7 @@ func (d *DocumentViewer) pushHistory() {
 	d.fwdStack = nil
 }
 
-// historyBack (Cmd+Left) returns to where the last jump came from, moving the
+// historyBack (Ctrl+I) returns to where the last jump came from, moving the
 // current location to the forward stack. Entries equal to the current
 // location are skipped: a jump that landed where it started left one behind.
 func (d *DocumentViewer) historyBack() {
@@ -869,7 +869,7 @@ func (d *DocumentViewer) historyBack() {
 	}
 }
 
-// historyForward (Cmd+Right) re-applies a jump undone by historyBack.
+// historyForward (Ctrl+O) re-applies a jump undone by historyBack.
 func (d *DocumentViewer) historyForward() {
 	cur, curOK := d.currentLoc()
 	for len(d.fwdStack) > 0 {
@@ -892,6 +892,32 @@ func (d *DocumentViewer) applyLoc(loc viewLoc) {
 	d.jumpToPage(loc.page0 + 1)
 	d.halfPageOffset = loc.halfOffset
 	d.flash = flashState{}
+}
+
+// pageStep is how far a plain arrow / j / k moves: a spread shows two pages, so
+// stepping by one would re-show a page that was already on screen. Half-page
+// mode does its own stepping and never asks.
+func (d *DocumentViewer) pageStep() int {
+	if d.dualPageMode == "vertical" || d.dualPageMode == "horizontal" {
+		return 2
+	}
+	return 1
+}
+
+// stepPages moves delta pages, clamped to the document. Landing short of a full
+// step at the end still moves to the last page, so the tail of the document is
+// always reachable.
+func (d *DocumentViewer) stepPages(delta int) {
+	page := d.currentPage + delta
+	if page < 0 {
+		page = 0
+	}
+	if page > len(d.textPages)-1 {
+		page = len(d.textPages) - 1
+	}
+	if page >= 0 {
+		d.currentPage = page
+	}
 }
 
 func (d *DocumentViewer) jumpToPage(page int) {
@@ -1062,12 +1088,10 @@ func (d *DocumentViewer) handleInput(c byte) int {
 				d.halfPageOffset = 1
 			} else {
 				d.halfPageOffset = 0
-				if d.currentPage < len(d.textPages)-1 {
-					d.currentPage++
-				}
+				d.stepPages(1)
 			}
-		} else if d.currentPage < len(d.textPages)-1 {
-			d.currentPage++
+		} else {
+			d.stepPages(d.pageStep())
 		}
 	case 'k':
 		if d.dualPageMode == "half" {
@@ -1075,12 +1099,10 @@ func (d *DocumentViewer) handleInput(c byte) int {
 				d.halfPageOffset = 0
 			} else {
 				d.halfPageOffset = 1
-				if d.currentPage > 0 {
-					d.currentPage--
-				}
+				d.stepPages(-1)
 			}
-		} else if d.currentPage > 0 {
-			d.currentPage--
+		} else {
+			d.stepPages(-d.pageStep())
 		}
 	case 'g':
 		return -2 // signal: go to page
@@ -1138,9 +1160,9 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		if d.handleCtrlClick() {
 			return -5 // internal jump queued on syncChan; its case redraws
 		}
-	case keyHistoryBack: // Cmd+Left — back through the jump history
+	case keyHistoryBack: // Ctrl+I (or Cmd+Left) — back through the jump history
 		d.historyBack()
-	case keyHistoryForward: // Cmd+Right — forward again
+	case keyHistoryForward: // Ctrl+O (or Cmd+Right) — forward again
 		d.historyForward()
 	case 'O':
 		absPath, _ := filepath.Abs(d.path)
@@ -1172,22 +1194,10 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		default:
 			d.dualPageMode = ""
 		}
-	case 'J': // Shift+Down/Right: jump 2 pages (in dual mode)
-		if d.dualPageMode != "" {
-			if d.currentPage < len(d.textPages)-2 {
-				d.currentPage += 2
-			} else if d.currentPage < len(d.textPages)-1 {
-				d.currentPage = len(d.textPages) - 1
-			}
-		}
-	case 'K': // Shift+Up/Left: jump back 2 pages (in dual mode)
-		if d.dualPageMode != "" {
-			if d.currentPage >= 2 {
-				d.currentPage -= 2
-			} else {
-				d.currentPage = 0
-			}
-		}
+	case 'J': // Shift+Down/Right: one page, whatever the plain step is
+		d.stepPages(1)
+	case 'K': // Shift+Up/Left: back one page
+		d.stepPages(-1)
 	case '{': // shift+[ — cut more from top
 		d.cropTop = min(d.cropTop+0.02, 0.45)
 	case '}': // shift+] — cut more from bottom

@@ -314,12 +314,17 @@ const keyMouseAltClick byte = 0xE8
 // under the click (see handleCtrlClick). Same cell side channel.
 const keyMouseCtrlClick byte = 0xE9
 
-// Cmd+Left / Cmd+Right — browser-style back/forward through the jump history.
-// Modified arrows keep their CSI 1;mods A-D shape (unlike Cmd+letter combos,
-// which need the CSI u encoding); Super contributes bit 8 of mods-1.
+// Back/forward through the jump history. Ctrl+I / Ctrl+O are the primary keys:
+// as plain control bytes nothing between the keyboard and here can claim them,
+// and they sit left-to-right on the keyboard the way back and forward do. That
+// is the opposite of vim's jumplist, where Ctrl+O goes back. Cmd+Left /
+// Cmd+Right stay as an alias, but macOS and the terminal both bind Cmd+arrow
+// (line start/end, tab switching), so the app may never see them. Modified
+// arrows keep their CSI 1;mods A-D shape (unlike Cmd+letter combos, which need
+// the CSI u encoding); Super contributes bit 8 of mods-1.
 const (
-	keyHistoryBack    byte = 0xEA // Cmd+Left
-	keyHistoryForward byte = 0xEB // Cmd+Right
+	keyHistoryBack    byte = 0xEA // Ctrl+I / Tab, or Cmd+Left
+	keyHistoryForward byte = 0xEB // Ctrl+O, or Cmd+Right
 )
 
 // parseKittyCSIU parses the parameter bytes of a Kitty keyboard protocol
@@ -395,6 +400,12 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if buf[0] >= 0x80 {
 				continue
 			}
+			switch buf[0] {
+			case 0x09: // Tab == Ctrl+I
+				return keyHistoryBack
+			case 0x0F: // Ctrl+O
+				return keyHistoryForward
+			}
 			return buf[0]
 		}
 
@@ -455,6 +466,17 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if rawMods > 0 {
 				const altSuper = 2 | 8 // Alt + Super (Cmd) bits, 0-based
 				modBits := rawMods - 1
+				// Ctrl+I collides with Tab and Ctrl+O with nothing, so the
+				// disambiguate flag can report either one here instead of as
+				// its control byte. Accept both encodings.
+				if modBits&(1|2|4|8) == 4 {
+					switch key {
+					case 'i':
+						return keyHistoryBack
+					case 'o':
+						return keyHistoryForward
+					}
+				}
 				if modBits&altSuper == altSuper {
 					shiftHeld := modBits&1 != 0
 					switch key {
