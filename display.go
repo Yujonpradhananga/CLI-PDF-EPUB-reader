@@ -14,6 +14,8 @@ func (d *DocumentViewer) displayCurrentPage() {
 	termWidth, termHeight := d.getTerminalSize()
 	actualPage := d.textPages[d.currentPage]
 
+	d.setTerminalTitle()
+
 	// Any previous Opt+click map is stale once we redraw; the image render
 	// paths below rebuild it (text pages leave it cleared, so clicks no-op).
 	d.clickMap = clickMap{}
@@ -450,6 +452,46 @@ func (d *DocumentViewer) statusIndicators() string {
 	return fmt.Sprintf("%s%s%s%s%s - %s",
 		fitIndicator, scaleIndicator, darkIndicator, cropIndicator, searchIndicator,
 		strings.ToUpper(d.fileType))
+}
+
+// setTerminalTitle reports the file name and page position as the OSC 2 window
+// title. agterm shows that title in its sidebar and session picker, so a reader
+// left open in another session says which document is on which page; tmux and
+// ssh forward it, and terminals that ignore OSC 2 drop it harmlessly. Rewritten
+// only when it changes, since a redraw happens on every keystroke.
+func (d *DocumentViewer) setTerminalTitle() {
+	pos := fmt.Sprintf("%d/%d", d.currentPage+1, len(d.textPages))
+	if d.pageStep() == 2 && d.currentPage+1 < len(d.textPages) {
+		pos = fmt.Sprintf("%d-%d/%d", d.currentPage+1, d.currentPage+2, len(d.textPages))
+	}
+	title := fmt.Sprintf("%s %s %s", titleIcon(d.fileType), filepath.Base(d.path), pos)
+	if title == d.lastTitle {
+		return
+	}
+	d.lastTitle = title
+	fmt.Printf("\x1b]2;%s\x07", title)
+	d.agterm.report(title)
+}
+
+// titleIcon marks the title as a document at a glance in a list of sessions
+// that are otherwise shells and agents.
+func titleIcon(fileType string) string {
+	switch fileType {
+	case "epub":
+		return "📗"
+	case "html", "htm":
+		return "🌐"
+	case "png", "jpg", "jpeg":
+		return "🖼"
+	default:
+		return "📕"
+	}
+}
+
+// clearTerminalTitle hands the title back on exit; the shell's next prompt sets
+// its own.
+func clearTerminalTitle() {
+	fmt.Print("\x1b]2;\x07")
 }
 
 // drawStatusBar writes the centered status line at the cursor: the file name,

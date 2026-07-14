@@ -96,6 +96,55 @@ func TestHalfPageModeStillHalfSteps(t *testing.T) {
 	}
 }
 
+func TestSearchJumpsPushHistory(t *testing.T) {
+	d := &DocumentViewer{textPages: []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}}
+	d.searchHits = []int{2, 7}
+	d.jumpToHit() // fresh search from page 0 lands on the first hit
+	if d.currentPage != 2 {
+		t.Fatalf("first hit: currentPage = %d, want 2", d.currentPage)
+	}
+	d.nextSearchHit() // page 7
+	d.nextSearchHit() // wraps to page 2
+	if d.currentPage != 2 {
+		t.Fatalf("after wrap: currentPage = %d, want 2", d.currentPage)
+	}
+	for _, want := range []int{7, 2, 0} {
+		d.historyBack()
+		if d.currentPage != want {
+			t.Fatalf("historyBack: currentPage = %d, want %d", d.currentPage, want)
+		}
+	}
+	d.historyForward()
+	if d.currentPage != 2 {
+		t.Fatalf("historyForward: currentPage = %d, want 2", d.currentPage)
+	}
+}
+
+func TestSearchHitOnSamePagePushesNothing(t *testing.T) {
+	d := &DocumentViewer{textPages: []int{0, 1, 2}}
+	d.searchHits = []int{1}
+	d.currentPage = 1
+	d.nextSearchHit()
+	if len(d.backStack) != 0 {
+		t.Fatalf("backStack = %v, want empty", d.backStack)
+	}
+}
+
+func TestGotoPushesHistory(t *testing.T) {
+	d := &DocumentViewer{textPages: []int{0, 1, 2, 3, 4}}
+	in := make(chan byte, 2)
+	in <- '4'
+	in <- 13 // Enter
+	d.goToPage(in)
+	if d.currentPage != 3 {
+		t.Fatalf("goToPage: currentPage = %d, want 3", d.currentPage)
+	}
+	d.historyBack()
+	if d.currentPage != 0 {
+		t.Fatalf("historyBack after goto: currentPage = %d, want 0", d.currentPage)
+	}
+}
+
 func TestHistoryKeys(t *testing.T) {
 	cases := []struct {
 		name string

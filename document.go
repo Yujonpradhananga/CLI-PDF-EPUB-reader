@@ -48,6 +48,8 @@ type DocumentViewer struct {
 	lastTermRows   int         // last known terminal rows (for change detection)
 	fifoPath       string      // path to FIFO for external page jump commands
 	skipClear      bool        // skip screen clear on next display (for smooth reload)
+	lastTitle      string      // last OSC-2 title written (see setTerminalTitle)
+	agterm         *agtermReporter
 	htmlPageWidth  int         // virtual page width in points for HTML layout (wider = smaller text)
 	isReflowable   bool        // true for HTML (supports layout adjustment)
 	darkMode       string      // "": off, "smart": HSL invert, "invert": simple RGB invert
@@ -110,9 +112,10 @@ type DocumentViewer struct {
 	linksMu   sync.Mutex
 
 	// Browser-style jump history (Ctrl+I / Ctrl+O). Entries hold PDF
-	// pages rather than textPages indices so they survive reloads. A link
-	// follow or forward-sync jump pushes onto backStack and clears fwdStack;
-	// historyBack/historyForward move between the stacks. Main-thread only.
+	// pages rather than textPages indices so they survive reloads. Any
+	// navigation jump — link follow, forward sync, search hit, go-to-page —
+	// pushes onto backStack and clears fwdStack; historyBack/historyForward
+	// move between the stacks. Main-thread only.
 	backStack []viewLoc
 	fwdStack  []viewLoc
 
@@ -466,6 +469,10 @@ func (d *DocumentViewer) Run() bool {
 
 	fmt.Print("\033[?25l")
 	defer fmt.Print("\033[?25h") // Show cursor on exit
+	defer clearTerminalTitle()
+
+	d.agterm = newAgtermReporter()
+	defer d.agterm.close()
 	// Force normal cursor-key mode (DECCKM reset) so arrows send ESC [ A-D rather
 	// than the SS3 ESC O A-D form that some terminals (e.g. agterm) default to.
 	fmt.Print("\033[?1l")
@@ -489,7 +496,8 @@ func (d *DocumentViewer) Run() bool {
 	installSignalCleanup()
 	sigRestoreMu.Lock()
 	sigRestore = func() {
-		fmt.Print("\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?25h")
+		fmt.Print("\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?25h\x1b]2;\x07")
+		d.agterm.close()
 		if d.oldState != nil {
 			term.Restore(int(os.Stdin.Fd()), d.oldState)
 		}
@@ -1508,11 +1516,22 @@ done:
 
 	if len(d.searchHits) > 0 {
 		// Jump to first hit
-		for i, p := range d.textPages {
-			if p == d.searchHits[0] {
+		d.jumpToHit()
+	}
+}
+
+// jumpToHit moves to the current search hit. A search jump is a navigation like
+// a link follow, so it records where it came from for Ctrl+I; cycling hits on
+// the same page moves nothing and records nothing.
+func (d *DocumentViewer) jumpToHit() {
+	targetPage := d.searchHits[d.searchHitIdx]
+	for i, p := range d.textPages {
+		if p == targetPage {
+			if i != d.currentPage {
+				d.pushHistory()
 				d.currentPage = i
-				break
 			}
+			break
 		}
 	}
 }
@@ -1522,13 +1541,7 @@ func (d *DocumentViewer) nextSearchHit() {
 		return
 	}
 	d.searchHitIdx = (d.searchHitIdx + 1) % len(d.searchHits)
-	targetPage := d.searchHits[d.searchHitIdx]
-	for i, p := range d.textPages {
-		if p == targetPage {
-			d.currentPage = i
-			break
-		}
-	}
+	d.jumpToHit()
 }
 
 func (d *DocumentViewer) prevSearchHit() {
@@ -1539,13 +1552,7 @@ func (d *DocumentViewer) prevSearchHit() {
 	if d.searchHitIdx < 0 {
 		d.searchHitIdx = len(d.searchHits) - 1
 	}
-	targetPage := d.searchHits[d.searchHitIdx]
-	for i, p := range d.textPages {
-		if p == targetPage {
-			d.currentPage = i
-			break
-		}
-	}
+	d.jumpToHit()
 }
 
 func (d *DocumentViewer) toggleViewMode() {
@@ -1591,7 +1598,8 @@ done:
 	fmt.Print("\033[?25l")
 	var num int
 	if _, err := fmt.Sscanf(string(input), "%d", &num); err == nil {
-		if num >= 1 && num <= len(d.textPages) {
+		if num >= 1 && num <= len(d.textPages) && num-1 != d.currentPage {
+			d.pushHistory()
 			d.currentPage = num - 1
 		}
 	}
