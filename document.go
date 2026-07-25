@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"html"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
@@ -15,6 +16,7 @@ import (
 	"os/signal"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +42,6 @@ type DocumentViewer struct {
 	searchQuery    string      // current search query
 	searchHits     []int       // pages with matches
 	searchHitIdx   int         // current index in searchHits
-	scaleFactor    float64     // image scale adjustment (1.0 = default)
 	lastModTime    time.Time   // for auto-reload detection
 	cellWidth      float64     // cached cell width in pixels
 	cellHeight     float64     // cached cell height in pixels
@@ -61,6 +62,12 @@ type DocumentViewer struct {
 	cropRight      float64     // fraction to cut from right edge
 	isImage        bool        // true for standalone image files (PNG, JPG)
 	sourceImage    image.Image // loaded image for standalone image viewing
+
+	// zoomByView is the image scale of each view, keyed by viewKey: the views
+	// fit pages to the terminal so differently that one shared scale left every
+	// view but the one it was set in unusable. Missing (or non-positive) means
+	// the view's own fit; see zoom.
+	zoomByView map[string]float64
 
 	// lastKittyImageID is the kitty graphics image id currently on screen. The next
 	// render draws the new page first, then deletes this id — so a reload (LaTeX
@@ -101,6 +108,11 @@ type DocumentViewer struct {
 	// renders the page, and getPageContentType runs it on every page display.
 	// Cleared in findContentPages on (re)open / relayout. Main-thread only.
 	visualContent map[int]bool
+
+	// searchLineCache caches the positioned text lines of a page (searchLines),
+	// which the search markers need on every redraw. Cleared alongside
+	// visualContent. Main-thread only.
+	searchLineCache map[int][]searchLine
 
 	// pageLinks caches documentLinks per 0-indexed page: warmed in the
 	// background at display time (warmPageLinks), read on Ctrl+click.
@@ -153,7 +165,7 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		tempDir:       tempDir,
 		cacheDir:      cacheDir,
 		fitMode:       cfg.FitMode,
-		scaleFactor:   cfg.ScaleFactor,
+		zoomByView:    cfg.ScaleFactors,
 		darkMode:      cfg.DarkMode,
 		dualPageMode:  cfg.DualPageMode,
 		forceMode:     cfg.ForceMode,
@@ -225,6 +237,46 @@ func (d *DocumentViewer) applyHTMLLayout() {
 	d.findContentPages()
 }
 
+// zoom limits for the +/- keys.
+const (
+	minZoom = 0.1
+	maxZoom = 2.0
+)
+
+// viewKey names the view the zoom keys act on. Each view fits pages to the
+// terminal differently — a scale that reads well with one page filling the
+// screen is far too large once two share it, and too small in the half-page
+// view — so every view carries its own zoom. Spelled out rather than reusing
+// dualPageMode because its "" would be an empty key in the saved config.
+func (d *DocumentViewer) viewKey() string {
+	if d.dualPageMode == "" {
+		return viewSingle
+	}
+	return d.dualPageMode
+}
+
+// zoom is the image scale of the view on screen; 1.0 is that view's own fit.
+func (d *DocumentViewer) zoom() float64 {
+	return d.zoomOf(d.viewKey())
+}
+
+// zoomOf reports the stored scale for a named view, 1.0 when it has none.
+func (d *DocumentViewer) zoomOf(view string) float64 {
+	if z := d.zoomByView[view]; z > 0 {
+		return z
+	}
+	return 1.0
+}
+
+// setZoom stores the scale for the view on screen, clamped to the range the
+// +/- keys allow.
+func (d *DocumentViewer) setZoom(z float64) {
+	if d.zoomByView == nil {
+		d.zoomByView = make(map[string]float64)
+	}
+	d.zoomByView[d.viewKey()] = min(max(z, minZoom), maxZoom)
+}
+
 // adjustHTMLZoom changes the page width and preserves approximate scroll position.
 func (d *DocumentViewer) adjustHTMLZoom(delta int) {
 	// Remember approximate position as fraction through document
@@ -261,6 +313,7 @@ func (d *DocumentViewer) findContentPages() {
 	// below repopulates it for sparse-text pages as a side effect. Cached
 	// links go stale the same way.
 	d.visualContent = make(map[int]bool)
+	d.searchLineCache = make(map[int][]searchLine)
 	d.linksMu.Lock()
 	d.pageLinks = make(map[int][]pageLink)
 	d.linksGen++
@@ -1140,20 +1193,14 @@ func (d *DocumentViewer) handleInput(c byte) int {
 			// Narrower page = larger text
 			d.adjustHTMLZoom(-100)
 		} else {
-			d.scaleFactor += 0.1
-			if d.scaleFactor > 2.0 {
-				d.scaleFactor = 2.0
-			}
+			d.setZoom(d.zoom() + 0.1)
 		}
 	case '-', '_':
 		if d.isReflowable {
 			// Wider page = smaller text
 			d.adjustHTMLZoom(100)
 		} else {
-			d.scaleFactor -= 0.1
-			if d.scaleFactor < 0.1 {
-				d.scaleFactor = 0.1
-			}
+			d.setZoom(d.zoom() - 0.1)
 		}
 	case 'r':
 		// Refresh cell size (useful after resolution/monitor change)
@@ -1461,6 +1508,74 @@ func (d *DocumentViewer) syncToVimAt(page0 int, x, y float64) {
 		exec.Command(filepath.Join(home, ".vim", "docviewer-to-vim.sh"),
 			srcFile, strconv.Itoa(line)).Run()
 	}()
+}
+
+// searchLine is one line of a page's text with the vertical center of its box
+// in PDF points (top-left origin). text is lowercased for matching against the
+// (already lowercased) search query.
+type searchLine struct {
+	y    float64
+	text string
+}
+
+// htmlLineRe matches one line of MuPDF's HTML rendering of a page's structured
+// text: <p style="top:90.4pt;left:66.1pt;line-height:10.9pt"><span …>…</span>…</p>.
+// The line box is what makes this worth parsing — doc.Text gives the same text
+// with no positions at all.
+var htmlLineRe = regexp.MustCompile(`(?s)<p[^>]*top:([0-9.]+)pt[^>]*>(.*?)</p>`)
+
+// htmlLineHeightRe pulls the line box height out of the same style attribute.
+var htmlLineHeightRe = regexp.MustCompile(`line-height:([0-9.]+)pt`)
+
+// htmlTagRe strips the per-font <span> markup inside a line.
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+// parseSearchLines extracts the positioned text lines from MuPDF's HTML output
+// for one page.
+func parseSearchLines(pageHTML string) []searchLine {
+	var lines []searchLine
+	for _, m := range htmlLineRe.FindAllStringSubmatch(pageHTML, -1) {
+		top, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			continue
+		}
+		text := strings.TrimSpace(html.UnescapeString(htmlTagRe.ReplaceAllString(m[2], "")))
+		if text == "" {
+			continue
+		}
+		// Aim at the middle of the line box: top alone sits a third of a
+		// terminal row high in the half-page view, enough to shift a marker.
+		center := top
+		if h := htmlLineHeightRe.FindStringSubmatch(m[0]); h != nil {
+			if lh, err := strconv.ParseFloat(h[1], 64); err == nil {
+				center += lh / 2
+			}
+		}
+		lines = append(lines, searchLine{y: center, text: strings.ToLower(text)})
+	}
+	return lines
+}
+
+// searchLines returns the page's text lines with their positions, cached per
+// page: a redraw happens on every keystroke, and the extraction runs the page
+// through MuPDF's structured-text device. Cleared on reload by findContentPages.
+func (d *DocumentViewer) searchLines(page0 int) []searchLine {
+	if lines, ok := d.searchLineCache[page0]; ok {
+		return lines
+	}
+	if d.doc == nil {
+		return nil
+	}
+	pageHTML, err := d.doc.HTML(page0, false)
+	if err != nil {
+		return nil
+	}
+	lines := parseSearchLines(pageHTML)
+	if d.searchLineCache == nil {
+		d.searchLineCache = make(map[int][]searchLine)
+	}
+	d.searchLineCache[page0] = lines
+	return lines
 }
 
 func (d *DocumentViewer) startSearch(inputChan <-chan byte) {

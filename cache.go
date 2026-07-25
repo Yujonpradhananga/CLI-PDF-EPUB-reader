@@ -47,7 +47,7 @@ func (d *DocumentViewer) snapshotParams() renderParams {
 	return renderParams{
 		pixelsPerChar:  pc,
 		pixelsPerLine:  pl,
-		scaleFactor:    d.scaleFactor,
+		scaleFactor:    d.zoom(),
 		fitMode:        d.fitMode,
 		darkMode:       d.darkMode,
 		cropTop:        d.cropTop,

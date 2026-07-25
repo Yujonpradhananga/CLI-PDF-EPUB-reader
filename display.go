@@ -41,7 +41,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	if d.dualPageMode == "half" {
 		d.displayHalfPage(termWidth, termHeight)
-		d.drawFlash(termWidth)
+		d.drawOverlays(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -49,7 +49,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	}
 	if d.dualPageMode != "" {
 		d.displayDualPage(termWidth, termHeight)
-		d.drawFlash(termWidth)
+		d.drawOverlays(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -67,7 +67,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	default:
 		d.displayTextPage(actualPage, termWidth, termHeight)
 	}
-	d.drawFlash(termWidth)
+	d.drawOverlays(termWidth)
 	fmt.Print("\033[9999;1H")
 
 	// Warm neighbor pages in the background so sequential reading is instant.
@@ -229,10 +229,6 @@ func (d *DocumentViewer) displayImagePage(pageNum, termWidth, termHeight int) {
 		fmt.Print("  (Image rendering failed)")
 		imageHeight = 2
 	}
-	// Show search match position markers on the right edge
-	if d.searchQuery != "" && imageHeight > 0 {
-		d.drawSearchMarkers(pageNum, termWidth, verticalPadding, imageHeight)
-	}
 	for row := imageHeight + 1 + verticalPadding; row <= termHeight-reserved; row++ {
 		fmt.Printf("\033[%d;1H", row)
 		fmt.Print(strings.Repeat(" ", termWidth))
@@ -303,45 +299,40 @@ func (d *DocumentViewer) displayMixedPage(pageNum, termWidth, termHeight int) {
 	d.displayPageInfo(pageNum, termWidth, "Image+Text")
 }
 
-func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, imageHeight int) {
-	text, err := d.doc.Text(pageNum)
-	if err != nil || strings.TrimSpace(text) == "" {
+// drawOverlays paints what sits beside the page image once it is on screen:
+// the search markers and the forward-sync marker. Every display path ends with
+// it, so both follow the image into whichever view is showing.
+func (d *DocumentViewer) drawOverlays(termWidth int) {
+	d.drawSearchMarkers(termWidth)
+	d.drawFlash(termWidth)
+}
+
+// drawSearchMarkers paints a yellow block in the margin beside every row of a
+// displayed page holding a search match. It reads the clickMap the render path
+// just rebuilt, so one implementation covers every image view — single page,
+// both 2-page layouts, half page — and each match sits on the row that shows
+// its own line rather than an estimate from its position in the page text. A
+// match cropped away, or in the half not on screen, has no cell and draws
+// nothing. Text pages leave the clickMap cleared and get no markers; they
+// highlight their matches inline instead.
+func (d *DocumentViewer) drawSearchMarkers(termWidth int) {
+	if d.searchQuery == "" || d.doc == nil {
 		return
 	}
-	lines := strings.Split(text, "\n")
-	totalLines := len(lines)
-	if totalLines == 0 {
-		return
-	}
-
-	// Find which lines contain matches and map to unique terminal rows
-	markerRows := make(map[int]bool)
-	query := d.searchQuery
-	for i, line := range lines {
-		if strings.Contains(strings.ToLower(line), query) {
-			row := topPadding + 1 + int(float64(i)/float64(totalLines)*float64(imageHeight))
-			if row < topPadding+1 {
-				row = topPadding + 1
+	drawn := make(map[[2]int]bool)
+	for _, t := range d.clickMap.targets {
+		for _, line := range d.searchLines(t.page0) {
+			if !strings.Contains(line.text, d.searchQuery) {
+				continue
 			}
-			if row > topPadding+imageHeight {
-				row = topPadding + imageHeight
+			col, row, ok := d.clickMap.markerCell(t.page0, line.y, termWidth)
+			if !ok || drawn[[2]int{col, row}] {
+				continue
 			}
-			markerRows[row] = true
+			drawn[[2]int{col, row}] = true
+			fmt.Printf("\033[%d;%dH", row, col)
+			fmt.Print("\033[43m \033[0m") // yellow block
 		}
-	}
-
-	// Draw markers in the margin column just right of the image (like
-	// drawFlash), falling back to the terminal edge if no click map.
-	col := termWidth
-	if d.clickMap.cols > 0 {
-		col = d.clickMap.originCol + d.clickMap.cols
-		if col > termWidth {
-			col = termWidth
-		}
-	}
-	for row := range markerRows {
-		fmt.Printf("\033[%d;%dH", row, col)
-		fmt.Print("\033[43m \033[0m") // yellow block
 	}
 }
 
@@ -427,8 +418,8 @@ func (d *DocumentViewer) statusIndicators() string {
 		// Show zoom as percentage relative to A4 width (595pt)
 		zoomPct := 595 * 100 / d.htmlPageWidth
 		scaleIndicator = fmt.Sprintf(" [zoom:%d%%]", zoomPct)
-	} else if d.scaleFactor != 1.0 {
-		scaleIndicator = fmt.Sprintf(" [%.0f%%]", d.scaleFactor*100)
+	} else if z := d.zoom(); z != 1.0 {
+		scaleIndicator = fmt.Sprintf(" [%.0f%%]", z*100)
 	}
 	darkIndicator := ""
 	switch d.darkMode {
@@ -738,7 +729,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  f                   - Cycle fit mode (height/width/auto)")
 	p("  i                   - Toggle dark mode (smart invert, preserves hue)")
 	p("  D                   - Toggle dark mode (simple color invert)")
-	p("  +/-                 - Zoom in/out (10%-200%)")
+	p("  +/-                 - Zoom in/out (10%-200%, kept per view)")
 	p("  2                   - Cycle view (off/vertical/horizontal/half-page)")
 	p("  Shift+Left/Right    - Move a single page (offsets a 2-page spread)")
 	p("  Arrow/j/k           - Navigate by half-page (in half-page mode)")
@@ -792,7 +783,7 @@ func (d *DocumentViewer) showDebugInfo(inputChan <-chan byte) {
 	p(fmt.Sprintf("Pixel size (TIOCGWINSZ): %d x %d", pixelW, pixelH))
 	p(fmt.Sprintf("Calculated terminal pixels: %.0f x %.0f", float64(cols)*cellW, float64(rows)*cellH))
 	p(fmt.Sprintf("Fit mode: %s", d.fitMode))
-	p(fmt.Sprintf("Scale factor: %.1f", d.scaleFactor))
+	p(fmt.Sprintf("Scale factor: %.1f (%s view)", d.zoom(), d.viewKey()))
 	xfer := "direct (chunked PNG)"
 	if kittyXferMode == kittyXferFile {
 		xfer = "file (t=f)"

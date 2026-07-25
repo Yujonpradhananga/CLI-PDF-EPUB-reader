@@ -168,6 +168,32 @@ func (m *clickMap) pdfToCell(page0 int, x, y float64) (col, row int, ok bool) {
 	return 0, 0, false
 }
 
+// markerCell places a margin marker for a point at height y (PDF points,
+// top-left origin) on page page0: the row showing that point, and the column
+// just outside the image on the side that page sits on — the left margin for
+// the left page of a side-by-side spread, the right margin for anything else,
+// since the page image covers the cells it occupies (see drawFlash). ok is
+// false when the page is not on screen, or when y is hidden — cropped away, or
+// in the half a half-page view is not showing.
+func (m *clickMap) markerCell(page0 int, y float64, termWidth int) (col, row int, ok bool) {
+	for _, t := range m.targets {
+		if t.page0 != page0 {
+			continue
+		}
+		// Any x inside the visible band gives the same row; take its middle.
+		_, row, ok = m.pdfToCell(page0, (t.fx0+t.fx1)/2*t.pageW, y)
+		if !ok {
+			return 0, 0, false
+		}
+		col = m.originCol + m.cols
+		if t.x1 <= m.pxW/2 {
+			col = m.originCol - 1
+		}
+		return min(max(col, 1), termWidth), row, true
+	}
+	return 0, 0, false
+}
+
 // cellSizePDF reports the page-point footprint of one terminal cell for the
 // target showing page0. Click-resolution tolerances (findLinkAt) must track
 // it: dual and half layouts change how much page a cell covers, and a
@@ -468,10 +494,7 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	effectiveWidth := termWidth - horizontalPadding
 	effectiveHeight := termHeight - verticalPadding
 
-	scale := d.scaleFactor
-	if scale == 0 {
-		scale = 1.0
-	}
+	scale := d.zoom()
 
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
@@ -735,11 +758,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 func (d *DocumentViewer) halfPageDPI(pageHeightAt72 float64, termHeight int, termType string, pixelsPerLine float64) float64 {
 	targetFullPixels := float64(termHeight) * pixelsPerLine / 0.55
 
-	scale := d.scaleFactor
-	if scale == 0 {
-		scale = 1.0
-	}
-	dpi := targetFullPixels / pageHeightAt72 * 72.0 * scale
+	dpi := targetFullPixels / pageHeightAt72 * 72.0 * d.zoom()
 
 	if dpi < 36 {
 		dpi = 36
@@ -805,11 +824,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		targetCropPixels := float64(termHeight) * pixelsPerLine
 		targetFullH := int(targetCropPixels / 0.55)
 
-		scale := d.scaleFactor
-		if scale == 0 {
-			scale = 1.0
-		}
-		targetFullH = int(float64(targetFullH) * scale)
+		targetFullH = int(float64(targetFullH) * d.zoom())
 		targetFullW := int(float64(targetFullH) * aspectRatio)
 
 		if targetFullW != srcW || targetFullH != srcH {
