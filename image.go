@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/blacktop/go-termimg"
 )
@@ -305,6 +306,58 @@ func scaleImage(src image.Image, targetW, targetH int) image.Image {
 	return dst
 }
 
+// maxRenderPixels bounds a single rasterized page. The supersample factor is
+// backed off rather than exceeding it, so a fullscreen window can't turn one
+// page into hundreds of megabytes of RGBA plus the PNG encode that follows.
+const maxRenderPixels = 24e6
+
+// superSampleFactor is how many times larger than its on-screen cell footprint a
+// page is rasterized for the kitty graphics protocol (kitty / ghostty / agterm).
+// The terminal scales the result back into the same cells, so the extra pixels
+// cost nothing on screen. agterm and ghostty report logical (1x) pixels via
+// TIOCGWINSZ, so on a retina panel the cell box is twice the pixels we size the
+// render against; at 2x the render only just reached that box and the terminal
+// still had to stretch it a little (the cell footprint is rounded up a cell in
+// each axis), which is what reads as soft. At 4x every placement is a downscale
+// with pixels to spare. targetW/targetH are the 1x pixel dimensions, used only
+// for the maxRenderPixels backoff. DOCVIEWER_SUPERSAMPLE pins the factor.
+func superSampleFactor(termType string, targetW, targetH int) float64 {
+	if termType != "kitty" {
+		return 1.0
+	}
+	ss := 4.0
+	if env := os.Getenv("DOCVIEWER_SUPERSAMPLE"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil && v >= 1 && v <= 8 {
+			ss = v
+		}
+	}
+	if px := float64(targetW) * float64(targetH); px > 0 {
+		if lim := math.Sqrt(maxRenderPixels / px); lim < ss {
+			ss = lim
+		}
+	}
+	if ss < 1 {
+		ss = 1
+	}
+	return ss
+}
+
+// imageSuperSample caps the factor to the detail a standalone image file
+// actually holds: scaling a photo past its own resolution burns pixels without
+// adding sharpness, and scaleImage samples nearest-neighbour.
+func imageSuperSample(src image.Image, targetW int, ss float64) float64 {
+	if src == nil || targetW <= 0 {
+		return 1
+	}
+	if avail := float64(src.Bounds().Dx()) / float64(targetW); avail < ss {
+		ss = avail
+	}
+	if ss < 1 {
+		ss = 1
+	}
+	return ss
+}
+
 func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string, rp renderParams) (string, int, int, int, int, error) {
 	if err := os.MkdirAll(d.cacheDir, 0o755); err != nil {
 		return "", 0, 0, 0, 0, err
@@ -317,16 +370,6 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	}
 
 	pixelsPerChar, pixelsPerLine := rp.pixelsPerChar, rp.pixelsPerLine
-
-	// Supersample for the kitty graphics protocol (kitty / ghostty / agterm). agterm and
-	// ghostty report logical (1x) pixels via TIOCGWINSZ, so a page rendered to match that
-	// size is upscaled by the terminal on a retina display -> blurry. Render at 2x and keep
-	// the cell footprint logical (divide it back out below); the terminal scales the hi-res
-	// image into the same cells -> crisp. No dependence on DOCVIEWER_CELL_SIZE.
-	superSample := 1.0
-	if termType == "kitty" {
-		superSample = 2.0
-	}
 
 	// Calculate target pixel dimensions based on terminal size
 	horizontalPadding := 4
@@ -387,10 +430,15 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		}
 	}
 
+	// Rasterize above the cell footprint; the footprint stays logical (the factor
+	// is divided back out below) and the terminal scales the hi-res image down.
+	superSample := superSampleFactor(termType, finalWidth, finalHeight)
+
 	// Get the image at final dimensions
 	var img image.Image
 	if d.isImage {
-		img = scaleImage(d.sourceImage, finalWidth, finalHeight)
+		superSample = imageSuperSample(d.sourceImage, finalWidth, superSample)
+		img = scaleImage(d.sourceImage, int(float64(finalWidth)*superSample), int(float64(finalHeight)*superSample))
 	} else {
 		// Calculate DPI needed to render at exactly the right size
 		dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
@@ -399,7 +447,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		if dpiForHeight < dpi {
 			dpi = dpiForHeight
 		}
-		dpi *= superSample // render hi-res; footprint stays logical (divided back out below)
+		dpi *= superSample
 
 		// Clamp DPI to reasonable range
 		if dpi < 36 {
@@ -485,8 +533,11 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	return imagePath, actualLines, imageWidthInChars, actualWidth, actualHeight, nil
 }
 
-// renderPageToImage renders a page to an in-memory image at the given terminal dimensions.
-func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, termType string) (image.Image, error) {
+// renderPageToImage renders a page to an in-memory image at the given terminal
+// dimensions, rasterized superSample times larger. The caller composites the
+// result and divides the factor back out of the cell footprint, so it passes the
+// same factor for every page of one composite.
+func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, termType string, superSample float64) (image.Image, error) {
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
 	horizontalPadding := 4
@@ -542,7 +593,10 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 
 	var img image.Image
 	if d.isImage {
-		img = scaleImage(d.sourceImage, finalWidth, finalHeight)
+		// Not capped to the source resolution here (unlike the single-page path):
+		// the caller divides one shared factor back out of the composite, so every
+		// page of it has to come back at exactly that scale.
+		img = scaleImage(d.sourceImage, int(float64(finalWidth)*superSample), int(float64(finalHeight)*superSample))
 	} else {
 		dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
 		dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
@@ -550,6 +604,7 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		if dpiForHeight < dpi {
 			dpi = dpiForHeight
 		}
+		dpi *= superSample
 
 		if dpi < 36 {
 			dpi = 36
@@ -558,6 +613,7 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		if termType != "kitty" {
 			maxDPI = 100.0
 		}
+		maxDPI *= superSample
 		if dpi > maxDPI {
 			dpi = maxDPI
 		}
@@ -627,7 +683,14 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		img2H = termHeight
 	}
 
-	page1Img, err := d.renderPageToImage(page1, img1W, img1H, termType)
+	// One factor for the whole composite, sized against the full terminal area:
+	// the two pages must come back at the same scale to be composited, and the
+	// footprint below divides it back out once.
+	superSample := superSampleFactor(termType,
+		int(float64(termWidth)*pixelsPerChar), int(float64(termHeight)*pixelsPerLine))
+	gap = int(float64(gap) * superSample) // keep the separator its old on-screen width
+
+	page1Img, err := d.renderPageToImage(page1, img1W, img1H, termType, superSample)
 	if err != nil {
 		return 0
 	}
@@ -635,7 +698,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 
 	var page2Img image.Image
 	if hasPage2 {
-		page2Img, err = d.renderPageToImage(page2, img2W, img2H, termType)
+		page2Img, err = d.renderPageToImage(page2, img2W, img2H, termType, superSample)
 		if err != nil {
 			return 0
 		}
@@ -727,11 +790,11 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		return 0
 	}
 
-	actualLines := int(float64(compositeH)/pixelsPerLine) + 1
+	actualLines := int(float64(compositeH)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
-	imageWidthInChars := int(float64(compositeW)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(compositeW)/pixelsPerChar/superSample) + 1
 
 	horizontalOffset := (termWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
@@ -754,11 +817,16 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 // halfPageDPI is the render DPI for half-page mode: chosen so that 55% of the
 // page height fills termHeight exactly, then clamped to what the terminal can
 // usefully display. The page box in points equals pixels at 72 DPI, so this
-// avoids a throwaway full render just to measure.
-func (d *DocumentViewer) halfPageDPI(pageHeightAt72 float64, termHeight int, termType string, pixelsPerLine float64) float64 {
-	targetFullPixels := float64(termHeight) * pixelsPerLine / 0.55
+// avoids a throwaway full render just to measure. It also returns the
+// supersample factor baked into that DPI, which callers must divide back out of
+// every pixel count they compare against the terminal's own cell geometry.
+func (d *DocumentViewer) halfPageDPI(pageWidthAt72, pageHeightAt72 float64, termHeight int, termType string, pixelsPerLine float64) (float64, float64) {
+	targetFullPixels := float64(termHeight) * pixelsPerLine / 0.55 * d.zoom()
 
-	dpi := targetFullPixels / pageHeightAt72 * 72.0 * d.zoom()
+	superSample := superSampleFactor(termType,
+		int(targetFullPixels*pageWidthAt72/pageHeightAt72), int(targetFullPixels))
+
+	dpi := targetFullPixels / pageHeightAt72 * 72.0 * superSample
 
 	if dpi < 36 {
 		dpi = 36
@@ -767,10 +835,11 @@ func (d *DocumentViewer) halfPageDPI(pageHeightAt72 float64, termHeight int, ter
 	if termType != "kitty" {
 		maxDPI = 100.0
 	}
+	maxDPI *= superSample
 	if dpi > maxDPI {
 		dpi = maxDPI
 	}
-	return dpi
+	return dpi, superSample
 }
 
 // halfPageBands returns the vertical bands of page pageNum that the two halves
@@ -788,14 +857,14 @@ func (d *DocumentViewer) halfPageBands(pageNum, termHeight int) (topY0, topY1, b
 		return 0, 0, 0, 0, false
 	}
 	_, pixelsPerLine := d.getTerminalCellSize()
-	dpi := d.halfPageDPI(float64(r.Dy()), termHeight, d.detectTerminalType(), pixelsPerLine)
+	dpi, superSample := d.halfPageDPI(float64(r.Dx()), float64(r.Dy()), termHeight, d.detectTerminalType(), pixelsPerLine)
 	fullH := float64(r.Dy()) * dpi / 72.0
 	if fullH <= 0 {
 		return 0, 0, 0, 0, false
 	}
 
 	cropFrac := 0.55
-	if want := float64(termHeight) * pixelsPerLine / fullH; want > cropFrac && want <= 1 {
+	if want := float64(termHeight) * pixelsPerLine * superSample / fullH; want > cropFrac && want <= 1 {
 		cropFrac = want
 	}
 
@@ -814,6 +883,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
 	var img image.Image
+	superSample := 1.0
 
 	if d.isImage {
 		// For standalone images, scale so that 55% of the height fills the terminal
@@ -826,6 +896,11 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 
 		targetFullH = int(float64(targetFullH) * d.zoom())
 		targetFullW := int(float64(targetFullH) * aspectRatio)
+
+		superSample = imageSuperSample(d.sourceImage, targetFullW,
+			superSampleFactor(termType, targetFullW, targetFullH))
+		targetFullW = int(float64(targetFullW) * superSample)
+		targetFullH = int(float64(targetFullH) * superSample)
 
 		if targetFullW != srcW || targetFullH != srcH {
 			img = scaleImage(d.sourceImage, targetFullW, targetFullH)
@@ -844,7 +919,8 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 			return 0
 		}
 
-		dpi := d.halfPageDPI(float64(pageHeightAt72), termHeight, termType, pixelsPerLine)
+		var dpi float64
+		dpi, superSample = d.halfPageDPI(float64(r.Dx()), float64(pageHeightAt72), termHeight, termType, pixelsPerLine)
 
 		rawImg, err := d.doc.ImageDPI(pageNum, dpi)
 		if err != nil {
@@ -864,7 +940,7 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	fullW := bounds.Dx()
 
 	// Crop enough to fill termHeight; ideally 55%, but more if DPI was clamped.
-	targetCropPixels := float64(termHeight) * pixelsPerLine
+	targetCropPixels := float64(termHeight) * pixelsPerLine * superSample
 	targetCropH := int(targetCropPixels)
 	cropH := fullH * 55 / 100
 	if cropH < targetCropH && targetCropH <= fullH {
@@ -903,11 +979,11 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	finalW := cb.Dx()
 	finalH := cb.Dy()
 
-	actualLines := int(float64(finalH)/pixelsPerLine) + 1
+	actualLines := int(float64(finalH)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
-	imageWidthInChars := int(float64(finalW)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(finalW)/pixelsPerChar/superSample) + 1
 
 	horizontalOffset := (termWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
