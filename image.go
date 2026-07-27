@@ -311,26 +311,37 @@ func scaleImage(src image.Image, targetW, targetH int) image.Image {
 // page into hundreds of megabytes of RGBA plus the PNG encode that follows.
 const maxRenderPixels = 24e6
 
-// superSampleFactor is how many times larger than its on-screen cell footprint a
-// page is rasterized for the kitty graphics protocol (kitty / ghostty / agterm).
-// The terminal scales the result back into the same cells, so the extra pixels
-// cost nothing on screen. agterm and ghostty report logical (1x) pixels via
-// TIOCGWINSZ, so on a retina panel the cell box is twice the pixels we size the
-// render against; at 2x the render only just reached that box and the terminal
-// still had to stretch it a little (the cell footprint is rounded up a cell in
-// each axis), which is what reads as soft. At 4x every placement is a downscale
-// with pixels to spare. targetW/targetH are the 1x pixel dimensions, used only
-// for the maxRenderPixels backoff. DOCVIEWER_SUPERSAMPLE pins the factor.
+// defaultSuperSample is how many times larger than its on-screen cell footprint
+// a page is rasterized for the kitty graphics protocol (kitty / ghostty /
+// agterm). The terminal scales the result back into the same cells, so the extra
+// pixels cost nothing on screen but everything in render and PNG-encode time,
+// which grows with the square of this. agterm and ghostty report logical (1x)
+// pixels via TIOCGWINSZ, so on a retina panel the cell box is twice the pixels
+// we size the render against and a factor of 1 leaves the terminal upscaling —
+// that is what reads as soft. 1.6 clears the box with enough margin to absorb
+// the cell footprint being rounded up a cell in each axis; past that the gain is
+// invisible and only the wait grows.
+const defaultSuperSample = 1.6
+
+// superSampleCeiling is the factor before the maxRenderPixels backoff.
+// renderSig includes it, so changing DOCVIEWER_SUPERSAMPLE re-renders instead of
+// serving pages the persistent cache rasterized at the old factor.
+func superSampleCeiling() float64 {
+	if env := os.Getenv("DOCVIEWER_SUPERSAMPLE"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil && v >= 1 && v <= 8 {
+			return v
+		}
+	}
+	return defaultSuperSample
+}
+
+// superSampleFactor returns the factor to rasterize with. targetW/targetH are
+// the 1x pixel dimensions, used only for the maxRenderPixels backoff.
 func superSampleFactor(termType string, targetW, targetH int) float64 {
 	if termType != "kitty" {
 		return 1.0
 	}
-	ss := 4.0
-	if env := os.Getenv("DOCVIEWER_SUPERSAMPLE"); env != "" {
-		if v, err := strconv.ParseFloat(env, 64); err == nil && v >= 1 && v <= 8 {
-			ss = v
-		}
-	}
+	ss := superSampleCeiling()
 	if px := float64(targetW) * float64(targetH); px > 0 {
 		if lim := math.Sqrt(maxRenderPixels / px); lim < ss {
 			ss = lim

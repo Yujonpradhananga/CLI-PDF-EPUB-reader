@@ -89,10 +89,10 @@ func persistentCacheDir() string {
 // persistent cache: across sessions the same cols x rows can be a different
 // monitor/font, i.e. different pixel dimensions.
 func renderSig(pageNum, termWidth, termHeight int, termType string, rp renderParams) string {
-	return fmt.Sprintf("p%d|w%d|h%d|t%s|f%s|s%.3f|d%s|dp%s|ho%d|c%.4f,%.4f,%.4f,%.4f|hw%d|m%d|px%.2fx%.2f",
+	return fmt.Sprintf("p%d|w%d|h%d|t%s|f%s|s%.3f|d%s|dp%s|ho%d|c%.4f,%.4f,%.4f,%.4f|hw%d|m%d|px%.2fx%.2f|ss%.2f",
 		pageNum, termWidth, termHeight, termType, rp.fitMode, rp.scaleFactor, rp.darkMode,
 		rp.dualPageMode, rp.halfPageOffset, rp.cropTop, rp.cropBottom, rp.cropLeft, rp.cropRight,
-		rp.htmlPageWidth, rp.lastMod, rp.pixelsPerChar, rp.pixelsPerLine)
+		rp.htmlPageWidth, rp.lastMod, rp.pixelsPerChar, rp.pixelsPerLine, superSampleCeiling())
 }
 
 // cachePath returns a stable filename in the persistent cache dir, keyed by
