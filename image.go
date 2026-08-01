@@ -1059,8 +1059,15 @@ func toRGBACopy(src image.Image) *image.RGBA {
 	return dst
 }
 
-// dimPageWhite is what 255 (paper white) maps to in "dim" dark mode.
-const dimPageWhite = 120
+// dimPageWhite is what 255 (paper white) maps to in "dim" dark mode, and
+// dimPageGamma is the curve applied before that scaling. A plain linear scale
+// would drag ink and its antialiased edges into the same gray band as the
+// paper; the gamma pushes everything below white back down so glyphs stay
+// black and the page keeps its contrast.
+const (
+	dimPageWhite = 120
+	dimPageGamma = 2.2
+)
 
 // pageBackground is the color to fill around page images: it must match what
 // the active dark mode turns paper white into, or the padding shows as a halo.
@@ -1134,7 +1141,7 @@ func dimPage(src image.Image) image.Image {
 
 	var lut [256]uint8
 	for v := 0; v < 256; v++ {
-		lut[v] = uint8(v * dimPageWhite / 255)
+		lut[v] = uint8(dimPageWhite * math.Pow(float64(v)/255.0, dimPageGamma))
 	}
 
 	pix := rgba.Pix
