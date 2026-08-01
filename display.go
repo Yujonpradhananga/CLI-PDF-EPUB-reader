@@ -173,8 +173,10 @@ func (d *DocumentViewer) displayTextPage(pageNum, termWidth, termHeight int) {
 	reserved := 2
 	available := termHeight - reserved
 
-	// Dark mode: white text on dark gray background
-	if d.darkMode != "" {
+	// Dark mode: white text on dark gray background (dim: dark text on gray)
+	if d.darkMode == "dim" {
+		fmt.Printf("\033[38;2;20;20;20m\033[48;2;%d;%d;%dm", dimPageWhite, dimPageWhite, dimPageWhite)
+	} else if d.darkMode != "" {
 		fmt.Print("\033[38;2;255;255;255m\033[48;2;30;30;30m")
 	}
 
@@ -427,6 +429,8 @@ func (d *DocumentViewer) statusIndicators() string {
 		darkIndicator = " [dark]"
 	case "invert":
 		darkIndicator = " [dark:inv]"
+	case "dim":
+		darkIndicator = " [dim]"
 	}
 	cropIndicator := ""
 	if d.cropTop > 0 || d.cropBottom > 0 || d.cropLeft > 0 || d.cropRight > 0 {
@@ -727,8 +731,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("Display:")
 	p("  t                   - Toggle view mode (auto/text/image)")
 	p("  f                   - Cycle fit mode (height/width/auto)")
-	p("  i                   - Toggle dark mode (smart invert, preserves hue)")
-	p("  D                   - Toggle dark mode (simple color invert)")
+	p("  D                   - Cycle page tint (white/dark/invert/gray)")
 	p("  +/-                 - Zoom in/out (10%-200%, kept per view)")
 	p("  2                   - Cycle view (off/vertical/horizontal/half-page)")
 	p("  Shift+Left/Right    - Move a single page (offsets a 2-page spread)")

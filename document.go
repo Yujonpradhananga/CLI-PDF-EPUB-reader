@@ -53,7 +53,7 @@ type DocumentViewer struct {
 	agterm         *agtermReporter
 	htmlPageWidth  int         // virtual page width in points for HTML layout (wider = smaller text)
 	isReflowable   bool        // true for HTML (supports layout adjustment)
-	darkMode       string      // "": off, "smart": HSL invert, "invert": simple RGB invert
+	darkMode       string      // "": off, "smart": HSL invert, "invert": simple RGB invert, "dim": gray paper
 	dualPageMode   string      // "": off, "vertical": stacked, "horizontal": side-by-side, "half": half-page
 	halfPageOffset int         // 0: top half, 1: bottom half (used when dualPageMode == "half")
 	cropTop        float64     // fraction to cut from top edge (0.0–0.45)
@@ -1224,17 +1224,16 @@ func (d *DocumentViewer) handleInput(c byte) int {
 	case 'O':
 		absPath, _ := filepath.Abs(d.path)
 		exec.Command("open", "-R", absPath).Start()
-	case 'i':
-		if d.darkMode == "smart" {
-			d.darkMode = ""
-		} else {
+	case 'D': // cycle: off -> dark -> invert -> dim -> off
+		switch d.darkMode {
+		case "":
 			d.darkMode = "smart"
-		}
-	case 'D':
-		if d.darkMode == "invert" {
-			d.darkMode = ""
-		} else {
+		case "smart":
 			d.darkMode = "invert"
+		case "invert":
+			d.darkMode = "dim"
+		default:
+			d.darkMode = ""
 		}
 	case 'd':
 		// Debug: show detected dimensions

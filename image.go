@@ -488,6 +488,8 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		finalImg = smartInvert(img)
 	case "invert":
 		finalImg = simpleInvert(img)
+	case "dim":
+		finalImg = dimPage(img)
 	}
 
 	// Apply user crop
@@ -641,6 +643,8 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		return smartInvert(img), nil
 	case "invert":
 		return simpleInvert(img), nil
+	case "dim":
+		return dimPage(img), nil
 	}
 	return img, nil
 }
@@ -735,10 +739,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		}
 
 		// Use white background (or dark if dark mode)
-		bgColor := color.RGBA{255, 255, 255, 255}
-		if d.darkMode != "" {
-			bgColor = color.RGBA{30, 30, 30, 255}
-		}
+		bgColor := d.pageBackground()
 		composite = image.NewRGBA(image.Rect(0, 0, compositeW, compositeH))
 		draw.Draw(composite, composite.Bounds(), &image.Uniform{bgColor}, image.Point{}, draw.Src)
 
@@ -770,10 +771,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 			compositeW += b2.Dx()
 		}
 
-		bgColor := color.RGBA{255, 255, 255, 255}
-		if d.darkMode != "" {
-			bgColor = color.RGBA{30, 30, 30, 255}
-		}
+		bgColor := d.pageBackground()
 		composite = image.NewRGBA(image.Rect(0, 0, compositeW, compositeH))
 		draw.Draw(composite, composite.Bounds(), &image.Uniform{bgColor}, image.Point{}, draw.Src)
 
@@ -944,6 +942,8 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		img = smartInvert(img)
 	case "invert":
 		img = simpleInvert(img)
+	case "dim":
+		img = dimPage(img)
 	}
 
 	bounds := img.Bounds()
@@ -1059,6 +1059,21 @@ func toRGBACopy(src image.Image) *image.RGBA {
 	return dst
 }
 
+// dimPageWhite is what 255 (paper white) maps to in "dim" dark mode.
+const dimPageWhite = 165
+
+// pageBackground is the color to fill around page images: it must match what
+// the active dark mode turns paper white into, or the padding shows as a halo.
+func (d *DocumentViewer) pageBackground() color.RGBA {
+	switch d.darkMode {
+	case "smart", "invert":
+		return color.RGBA{30, 30, 30, 255}
+	case "dim":
+		return color.RGBA{dimPageWhite, dimPageWhite, dimPageWhite, 255}
+	}
+	return color.RGBA{255, 255, 255, 255}
+}
+
 // smartInvert inverts lightness while preserving hue and saturation.
 // White backgrounds become black, black text becomes white, colors keep their hue.
 // Grayscale pixels (r==g==b — virtually all of a rendered PDF page) go through a
@@ -1101,6 +1116,25 @@ func simpleInvert(src image.Image) image.Image {
 	var lut [256]uint8
 	for v := 0; v < 256; v++ {
 		lut[v] = uint8(30 + (255-v)*225/255)
+	}
+
+	pix := rgba.Pix
+	for i := 0; i < len(pix); i += 4 {
+		pix[i] = lut[pix[i]]
+		pix[i+1] = lut[pix[i+1]]
+		pix[i+2] = lut[pix[i+2]]
+	}
+	return rgba
+}
+
+// dimPage darkens the page without inverting it: white paper becomes mid gray,
+// dark ink stays dark. Linear per channel, so hues are preserved.
+func dimPage(src image.Image) image.Image {
+	rgba := toRGBACopy(src)
+
+	var lut [256]uint8
+	for v := 0; v < 256; v++ {
+		lut[v] = uint8(v * dimPageWhite / 255)
 	}
 
 	pix := rgba.Pix
