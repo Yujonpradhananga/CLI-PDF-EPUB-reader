@@ -1060,7 +1060,7 @@ func toRGBACopy(src image.Image) *image.RGBA {
 }
 
 // dimPageWhite is what 255 (paper white) maps to in "dim" dark mode.
-const dimPageWhite = 165
+const dimPageWhite = 120
 
 // pageBackground is the color to fill around page images: it must match what
 // the active dark mode turns paper white into, or the padding shows as a halo.
