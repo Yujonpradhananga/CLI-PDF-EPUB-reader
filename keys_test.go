@@ -42,6 +42,7 @@ func TestPagingStepsBySpread(t *testing.T) {
 		{"spread back steps two", "horizontal", []byte{'j', 'j', 'k'}, 2},
 		{"shift is a single page in single mode", "", []byte{'J', 'J'}, 2},
 		{"space follows the spread step", "horizontal", []byte{' '}, 2},
+		{"arrows page like j/k", "", []byte{keyArrowNext, keyArrowNext, keyArrowPrev}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -158,10 +159,16 @@ func TestHistoryKeys(t *testing.T) {
 		{"cmd+left", "\x1b[1;9D", keyHistoryBack},
 		{"cmd+right", "\x1b[1;9C", keyHistoryForward},
 		// Unmodified keys must keep their meanings: 'i' toggles dark mode and a
-		// bare left arrow pages back.
+		// bare arrow pages — via its synthetic code, so overlays that accept
+		// typed text can tell an arrow from a typed 'j'/'k'.
 		{"plain i", "i", 'i'},
 		{"plain o", "o", 'o'},
-		{"left arrow", "\x1b[D", 'k'},
+		{"esc disambiguated CSI u", "\x1b[27u", 27},
+		{"ctrl+c disambiguated CSI u", "\x1b[99;5u", 3},
+		{"up arrow", "\x1b[A", keyArrowPrev},
+		{"left arrow", "\x1b[D", keyArrowPrev},
+		{"down arrow", "\x1b[B", keyArrowNext},
+		{"right arrow", "\x1b[C", keyArrowNext},
 		{"shift+left arrow", "\x1b[1;2D", 'K'},
 	}
 	for _, tc := range cases {

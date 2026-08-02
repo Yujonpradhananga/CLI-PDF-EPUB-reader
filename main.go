@@ -146,6 +146,7 @@ KEYBOARD SHORTCUTS:
         j, Space, Down, Right    Next page
         k, Up, Left              Previous page
         g                        Go to specific page
+        T                        Table of contents (fuzzy search, Enter jumps)
         Ctrl+Click               Follow link under click (refs, citations, URLs)
         Cmd+Left, Cmd+Right      Back / forward through jump history
         b                        Back to file picker

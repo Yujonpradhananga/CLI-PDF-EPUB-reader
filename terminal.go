@@ -314,6 +314,15 @@ const keyMouseAltClick byte = 0xE8
 // under the click (see handleCtrlClick). Same cell side channel.
 const keyMouseCtrlClick byte = 0xE9
 
+// Plain arrows are delivered as synthetic keys rather than translated to
+// 'j'/'k' here: modal overlays that accept typed text (the TOC picker) must
+// tell an arrow from a typed letter. handleInput maps them onto the same
+// paging actions the letters trigger.
+const (
+	keyArrowPrev byte = 0xEC // Up / Left
+	keyArrowNext byte = 0xED // Down / Right
+)
+
 // Back/forward through the jump history. Ctrl+I / Ctrl+O are the primary keys:
 // as plain control bytes nothing between the keyboard and here can claim them,
 // and they sit left-to-right on the keyboard the way back and forward do. That
@@ -396,7 +405,7 @@ func (d *DocumentViewer) readSingleChar() byte {
 		// flow back as commands, because those are destructive (crop / dark mode).
 		if buf[0] != 27 {
 			// Bytes >= 0x80 (pasted or IME-typed UTF-8) must not surface as
-			// commands: they would forge the 0xE0-0xEB synthetic keys.
+			// commands: they would forge the 0xE0-0xED synthetic keys.
 			if buf[0] >= 0x80 {
 				continue
 			}
@@ -452,7 +461,7 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if shift {
 				return 'K'
 			}
-			return 'k'
+			return keyArrowPrev
 		case 'B', 'C': // Down / Right -> next page
 			if super && final == 'C' { // Cmd+Right: history forward
 				return keyHistoryForward
@@ -460,9 +469,14 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if shift {
 				return 'J'
 			}
-			return 'j'
+			return keyArrowNext
 		case 'u': // Kitty keyboard protocol: CSI key ; modifiers u
 			key, rawMods := parseKittyCSIU(params)
+			// The disambiguate flag reports Esc as CSI 27 u rather than a bare
+			// 0x1b; the TOC picker closes on it, so it must surface as a key.
+			if key == 27 {
+				return 27
+			}
 			if rawMods > 0 {
 				const altSuper = 2 | 8 // Alt + Super (Cmd) bits, 0-based
 				modBits := rawMods - 1
@@ -475,6 +489,8 @@ func (d *DocumentViewer) readSingleChar() byte {
 						return keyHistoryBack
 					case 'o':
 						return keyHistoryForward
+					case 'c': // Ctrl+C, reported as CSI u under the same flag
+						return 3
 					}
 				}
 				if modBits&altSuper == altSuper {

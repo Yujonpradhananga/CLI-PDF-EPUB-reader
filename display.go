@@ -720,6 +720,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  j/Space/Down/Right  - Next page (next spread in 2-page mode)")
 	p("  k/Up/Left           - Previous page (previous spread in 2-page mode)")
 	p("  g                   - Go to specific page")
+	p("  T                   - Table of contents (fuzzy search, Enter jumps)")
 	p("  Ctrl+I / Ctrl+O     - Back / forward through jump history")
 	p("  b                   - Back to file list")
 	p("")

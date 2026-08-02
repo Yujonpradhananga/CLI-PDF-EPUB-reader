@@ -36,6 +36,7 @@ A terminal-based PDF, EPUB, and DOCX viewer with fuzzy file search, high-resolut
 | `j` / `Space` / `Down` / `Right` | Next page |
 | `k` / `Up` / `Left` | Previous page |
 | `g` | Go to specific page |
+| `T` | Table of contents overlay (fuzzy search, Enter jumps) |
 | `b` | Back to file picker |
 | `/` | Search in document |
 | `n` | Next search result |

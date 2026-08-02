@@ -114,6 +114,11 @@ type DocumentViewer struct {
 	// visualContent. Main-thread only.
 	searchLineCache map[int][]searchLine
 
+	// toc is the document outline for the 'T' picker, flattened by documentTOC.
+	// Extracted in findContentPages on every (re)open and relayout so its page
+	// numbers track the current document. Main-thread only.
+	toc []tocEntry
+
 	// pageLinks caches documentLinks per 0-indexed page: warmed in the
 	// background at display time (warmPageLinks), read on Ctrl+click.
 	// Guarded by linksMu; linksGen bumps on every invalidation so a warm
@@ -314,6 +319,7 @@ func (d *DocumentViewer) findContentPages() {
 	// links go stale the same way.
 	d.visualContent = make(map[int]bool)
 	d.searchLineCache = make(map[int][]searchLine)
+	d.toc = documentTOC(d.doc)
 	d.linksMu.Lock()
 	d.pageLinks = make(map[int][]pageLink)
 	d.linksGen++
@@ -636,6 +642,10 @@ func (d *DocumentViewer) Run() bool {
 				// A link follow queued its target on syncChan; that case
 				// jumps and redraws — don't redraw the old page first.
 				continue
+			case -6:
+				if d.showTOC(inputChan) {
+					continue // jump queued on syncChan; its case redraws
+				}
 			}
 			d.displayCurrentPage()
 		case t := <-syncChan:
@@ -1076,6 +1086,7 @@ func (d *DocumentViewer) checkAndReload() bool {
 	oldDoc := d.doc
 	oldPages := d.textPages
 	oldPage := d.currentPage
+	oldTOC := d.toc
 
 	d.doc = doc
 	if d.isReflowable {
@@ -1089,6 +1100,7 @@ func (d *DocumentViewer) checkAndReload() bool {
 		d.doc = oldDoc
 		d.textPages = oldPages
 		d.currentPage = oldPage
+		d.toc = oldTOC
 		doc.Close()
 		return false
 	}
@@ -1137,7 +1149,8 @@ func pdfLooksComplete(path string) bool {
 	return bytes.Contains(buf, []byte("%%EOF"))
 }
 
-// handleInput returns: 0 = continue, 1 = quit, -1 = search, -2 = goto page
+// handleInput returns: 0 = continue, 1 = quit, -1 = search, -2 = goto page,
+// -6 = table of contents
 func (d *DocumentViewer) handleInput(c byte) int {
 	switch c {
 	case 'q':
@@ -1145,7 +1158,7 @@ func (d *DocumentViewer) handleInput(c byte) int {
 	case 'b':
 		d.wantBack = true
 		return 1
-	case 'j', ' ':
+	case 'j', ' ', keyArrowNext:
 		if d.dualPageMode == "half" {
 			if d.halfPageOffset == 0 {
 				d.halfPageOffset = 1
@@ -1156,7 +1169,7 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		} else {
 			d.stepPages(d.pageStep())
 		}
-	case 'k':
+	case 'k', keyArrowPrev:
 		if d.dualPageMode == "half" {
 			if d.halfPageOffset == 1 {
 				d.halfPageOffset = 0
@@ -1169,6 +1182,8 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		}
 	case 'g':
 		return -2 // signal: go to page
+	case 'T':
+		return -6 // signal: show table of contents
 	case 'h', '?':
 		return -3 // signal: show help
 	case 't':
