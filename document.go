@@ -1239,14 +1239,14 @@ func (d *DocumentViewer) handleInput(c byte) int {
 	case 'O':
 		absPath, _ := filepath.Abs(d.path)
 		exec.Command("open", "-R", absPath).Start()
-	case 'D': // cycle: off -> dark -> invert -> dim -> off
+	case 'D': // cycle: off -> dim -> dark -> invert -> off
 		switch d.darkMode {
 		case "":
+			d.darkMode = "dim"
+		case "dim":
 			d.darkMode = "smart"
 		case "smart":
 			d.darkMode = "invert"
-		case "invert":
-			d.darkMode = "dim"
 		default:
 			d.darkMode = ""
 		}

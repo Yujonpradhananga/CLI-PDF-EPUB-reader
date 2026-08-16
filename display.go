@@ -732,7 +732,7 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("Display:")
 	p("  t                   - Toggle view mode (auto/text/image)")
 	p("  f                   - Cycle fit mode (height/width/auto)")
-	p("  D                   - Cycle page tint (white/dark/invert/gray)")
+	p("  D                   - Cycle page tint (white/gray/dark/invert)")
 	p("  +/-                 - Zoom in/out (10%-200%, kept per view)")
 	p("  2                   - Cycle view (off/vertical/horizontal/half-page)")
 	p("  Shift+Left/Right    - Move a single page (offsets a 2-page spread)")

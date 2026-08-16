@@ -159,7 +159,7 @@ KEYBOARD SHORTCUTS:
     Display:
         t                        Toggle view mode (auto/text/image)
         f                        Cycle fit modes (height/width/auto)
-        D                        Cycle page tint (white/dark/invert/gray)
+        D                        Cycle page tint (white/gray/dark/invert)
         +, =                     Zoom in
         -                        Zoom out
         r                        Refresh display (re-detect cell size)
