@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,7 @@ type DocumentViewer struct {
 	path        string
 	fileType    string // "pdf" or "epub"
 	tempDir     string // for storing temporary image files
+	cacheDir    string // persistent cross-session render cache
 	forceMode   string // "", "text", or "image" - override auto-detection
 	fitMode      string  // "auto", "height", "width"
 	wantBack     bool    // signal to go back to file picker
@@ -49,7 +51,7 @@ type DocumentViewer struct {
 	skipClear     bool   // skip screen clear on next display (for smooth reload)
 	htmlPageWidth int    // virtual page width in points for HTML layout (wider = smaller text)
 	isReflowable  bool   // true for HTML (supports layout adjustment)
-	darkMode       string // "": off, "smart": HSL invert, "invert": simple RGB invert
+	darkMode       string // "": off, "smart": HSL invert, "invert": simple RGB invert, "dim": gray paper
 	dualPageMode   string // "": off, "vertical": stacked, "horizontal": side-by-side, "half": half-page
 	halfPageOffset int    // 0: top half, 1: bottom half (used when dualPageMode == "half")
 	cropTop        float64 // fraction to cut from top edge (0.0–0.45)
@@ -58,6 +60,28 @@ type DocumentViewer struct {
 	cropRight      float64 // fraction to cut from right edge
 	chapters       []Chapter // table of contents / chapter list
 	currentChapter int       // index into chapters for current position
+
+	// lastKittyImageID is the kitty graphics image id currently on screen.
+	// The next render draws the new page first, then deletes this id.
+	lastKittyImageID uint32
+
+	// Per-frame PNGs for the dual/half display paths (not covered by the render
+	// cache). Each frame gets a fresh file; the previous frame's file is deleted
+	// only after the next one is transmitted.
+	ephemeralSeq      int
+	lastEphemeralPath string
+
+	// Rendered-page cache: maps a render signature to an on-disk PNG so
+	// revisiting a page is instant, and a background goroutine can prefetch
+	// neighbors.
+	renderCache map[string]cachedRender
+	cacheOrder  []string        // insertion order for simple LRU eviction
+	inFlight    map[string]bool // signatures currently being prefetched
+	cacheMu     sync.Mutex
+
+	// visualContent caches pageHasVisualContent per page number. Cleared in
+	// findContentPages on (re)open / relayout. Main-thread only.
+	visualContent map[int]bool
 }
 
 // NewDocumentViewer creates a new viewer for the given file path.
@@ -66,6 +90,10 @@ func NewDocumentViewer(path string) *DocumentViewer {
 	fileType := strings.TrimPrefix(ext, ".")
 
 	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("docviewer_%d", time.Now().UnixNano()))
+	cacheDir := persistentCacheDir()
+	if cacheDir == "" {
+		cacheDir = tempDir // no persistence, but everything still works
+	}
 
 	absPath, _ := filepath.Abs(path)
 	cfg := config.Load(absPath)
@@ -74,6 +102,7 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		path:          path,
 		fileType:      fileType,
 		tempDir:       tempDir,
+		cacheDir:      cacheDir,
 		fitMode:       cfg.FitMode,
 		scaleFactor:   cfg.ScaleFactor,
 		darkMode:      cfg.DarkMode,
@@ -85,6 +114,8 @@ func NewDocumentViewer(path string) *DocumentViewer {
 		cropLeft:      cfg.CropLeft,
 		cropRight:     cfg.CropRight,
 		isReflowable:  fileType == "html" || fileType == "htm",
+		renderCache:   make(map[string]cachedRender),
+		inFlight:      make(map[string]bool),
 	}
 
 	return dv
@@ -92,6 +123,9 @@ func NewDocumentViewer(path string) *DocumentViewer {
 
 // Open opens the document and prepares it for viewing.
 func (d *DocumentViewer) Open() error {
+	// Prune the persistent render cache in the background.
+	go gcPersistentCache(d.cacheDir)
+
 	doc, err := fitz.New(d.path)
 	if err != nil {
 		return fmt.Errorf("error opening %s: %v", d.fileType, err)
@@ -121,6 +155,10 @@ func (d *DocumentViewer) Run() bool {
 	defer d.doc.Close()
 	defer d.cleanup()
 	defer d.saveConfig()
+	defer d.clearKittyGraphics()
+
+	// Probe kitty file transfer mode before the input goroutine starts.
+	d.probeKittyTransferMode()
 
 	d.cellWidth, d.cellHeight = terminal.DetectCellSize()
 
@@ -406,6 +444,7 @@ func (d *DocumentViewer) adjustHTMLZoom(delta int) {
 
 func (d *DocumentViewer) findContentPages() {
 	d.textPages = []int{}
+	d.visualContent = nil // clear visual content cache on reload
 	for i := 0; i < d.doc.NumPage(); i++ {
 		hasContent := false
 
@@ -429,6 +468,24 @@ func (d *DocumentViewer) findContentPages() {
 }
 
 func (d *DocumentViewer) pageHasVisualContent(pageNum int) bool {
+	// Check cache first (main-thread only, no lock needed)
+	if d.visualContent != nil {
+		if v, ok := d.visualContent[pageNum]; ok {
+			return v
+		}
+	}
+
+	result := d.pageHasVisualContentUncached(pageNum)
+
+	// Store in cache
+	if d.visualContent == nil {
+		d.visualContent = make(map[int]bool)
+	}
+	d.visualContent[pageNum] = result
+	return result
+}
+
+func (d *DocumentViewer) pageHasVisualContentUncached(pageNum int) bool {
 	img, err := d.doc.Image(pageNum)
 	if err != nil {
 		return false

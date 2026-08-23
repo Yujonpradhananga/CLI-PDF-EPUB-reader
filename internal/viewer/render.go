@@ -6,13 +6,59 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/blacktop/go-termimg"
 
 	"pdf-cli/internal/imgutil"
 )
+
+// fastPNG encodes rendered pages with the fastest compression. These PNGs are
+// short-lived local temp files handed straight to the terminal, so encode speed
+// matters far more than file size (BestSpeed is ~3-5x faster than default).
+var fastPNG = png.Encoder{CompressionLevel: png.BestSpeed}
+
+// maxRenderPixels bounds a single rasterized page. The supersample factor is
+// backed off rather than exceeding it.
+const maxRenderPixels = 24e6
+
+// defaultSuperSample is how many times larger than its on-screen cell footprint
+// a page is rasterized for the kitty graphics protocol. On a retina panel the
+// cell box is twice the pixels we size the render against and a factor of 1
+// leaves the terminal upscaling — that is what reads as soft.
+const defaultSuperSample = 1.6
+
+// superSampleCeiling returns the supersample factor (env-overridable).
+// renderSig includes it, so changing DOCVIEWER_SUPERSAMPLE re-renders.
+func superSampleCeiling() float64 {
+	if env := os.Getenv("DOCVIEWER_SUPERSAMPLE"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil && v >= 1 && v <= 8 {
+			return v
+		}
+	}
+	return defaultSuperSample
+}
+
+// superSampleFactor returns the factor to rasterize with. targetW/targetH are
+// the 1x pixel dimensions, used only for the maxRenderPixels backoff.
+func superSampleFactor(termType string, targetW, targetH int) float64 {
+	if termType != "kitty" {
+		return 1.0
+	}
+	ss := superSampleCeiling()
+	if px := float64(targetW) * float64(targetH); px > 0 {
+		if lim := math.Sqrt(maxRenderPixels / px); lim < ss {
+			ss = lim
+		}
+	}
+	if ss < 1 {
+		ss = 1
+	}
+	return ss
+}
 
 func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 	if maxHeight <= 0 {
@@ -20,26 +66,33 @@ func (d *DocumentViewer) renderPageImage(pageNum, maxWidth, maxHeight int) int {
 	}
 
 	termType := d.detectTerminalType()
-	imagePath, actualHeight, imageWidthInChars, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType)
+	rp := d.snapshotParams() // main thread: safe to read viewer state
+	imagePath, actualHeight, imageWidthInChars, actualPixelWidth, actualPixelHeight, err := d.savePageAsImage(pageNum, maxWidth, maxHeight, termType, rp)
 	if err != nil {
 		return 0
 	}
-	defer os.Remove(imagePath)
+	// Note: imagePath is owned by the render cache (evicted later); do not delete here.
 
 	horizontalOffset := (maxWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, termType)
+	return d.renderWithTermImg(imagePath, actualHeight, horizontalOffset, imageWidthInChars, actualPixelWidth, actualPixelHeight, termType)
 }
 
-func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string) (string, int, int, error) {
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return "", 0, 0, err
+func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, termType string, rp renderParams) (string, int, int, int, int, error) {
+	if err := os.MkdirAll(d.cacheDir, 0o755); err != nil {
+		return "", 0, 0, 0, 0, err
 	}
 
-	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
+	// Serve from the render cache when nothing affecting the output changed.
+	sig := renderSig(pageNum, termWidth, termHeight, termType, rp)
+	if c, ok := d.cacheGet(sig); ok {
+		return c.path, c.lines, c.widthChars, c.pxW, c.pxH, nil
+	}
+
+	pixelsPerChar, pixelsPerLine := rp.pixelsPerChar, rp.pixelsPerLine
 
 	// Calculate target pixel dimensions based on terminal size
 	horizontalPadding := 4
@@ -48,7 +101,7 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	effectiveHeight := termHeight - verticalPadding
 
 	// Apply user scale factor
-	scale := d.scaleFactor
+	scale := rp.scaleFactor
 	if scale == 0 {
 		scale = 1.0
 	}
@@ -56,19 +109,22 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	// Get page dimensions at 72 DPI to calculate proper render DPI
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+	// Page box in points == pixels at 72 DPI. Bound() just queries geometry;
+	// it avoids a full throwaway render of the page on every switch.
+	r, err := d.doc.Bound(pageNum)
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, 0, 0, err
 	}
-	testBounds := testImg.Bounds()
-	pageWidthAt72 := testBounds.Dx()
-	pageHeightAt72 := testBounds.Dy()
+	pageWidthAt72 := r.Dx()
+	pageHeightAt72 := r.Dy()
+	if pageWidthAt72 <= 0 || pageHeightAt72 <= 0 {
+		return "", 0, 0, 0, 0, fmt.Errorf("invalid page bounds for page %d", pageNum)
+	}
 	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
 	// Calculate final dimensions based on fit mode
 	var finalWidth, finalHeight int
-	switch d.fitMode {
+	switch rp.fitMode {
 	case "height":
 		finalHeight = targetPixelHeight
 		finalWidth = int(float64(finalHeight) / aspectRatio)
@@ -88,6 +144,9 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 		}
 	}
 
+	// Rasterize above the cell footprint for HiDPI sharpness on Kitty terminals.
+	superSample := superSampleFactor(termType, finalWidth, finalHeight)
+
 	// Calculate DPI needed to render at exactly the right size
 	dpiForWidth := float64(finalWidth) / float64(pageWidthAt72) * 72.0
 	dpiForHeight := float64(finalHeight) / float64(pageHeightAt72) * 72.0
@@ -95,16 +154,17 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	if dpiForHeight < dpi {
 		dpi = dpiForHeight
 	}
+	dpi *= superSample
 
 	// Clamp DPI to reasonable range
 	if dpi < 36 {
 		dpi = 36
 	}
-	// Kitty handles high-res images natively; Sixel terminals need lower DPI
 	maxDPI := 300.0
 	if termType != "kitty" {
-		maxDPI = 150.0
+		maxDPI = 100.0
 	}
+	maxDPI *= superSample
 	if dpi > maxDPI {
 		dpi = maxDPI
 	}
@@ -112,39 +172,71 @@ func (d *DocumentViewer) savePageAsImage(pageNum, termWidth, termHeight int, ter
 	// Render at calculated DPI - no resizing needed
 	img, err := d.doc.ImageDPI(pageNum, dpi)
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, 0, 0, err
 	}
 
-	bounds := img.Bounds()
+	// Apply dark mode
+	var finalImg image.Image = img
+	switch rp.darkMode {
+	case "smart":
+		finalImg = imgutil.SmartInvert(img)
+	case "invert":
+		finalImg = imgutil.SimpleInvert(img)
+	case "dim":
+		finalImg = imgutil.DimPage(img)
+	}
+
+	// Apply user crop
+	finalImg = imgutil.CropImage(finalImg, rp.cropTop, rp.cropBottom, rp.cropLeft, rp.cropRight)
+
+	bounds := finalImg.Bounds()
 	actualWidth := bounds.Dx()
 	actualHeight := bounds.Dy()
 
-	actualLines := int(float64(actualHeight)/pixelsPerLine) + 1
+	// Divide the supersample factor back out so the cell footprint stays logical.
+	actualLines := int(float64(actualHeight)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
 
-	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(actualWidth)/pixelsPerChar/superSample) + 1
 
-	filename := fmt.Sprintf("page_%d.png", pageNum)
-	imagePath := filepath.Join(d.tempDir, filename)
+	// Per-signature filename in the shared persistent cache dir. Write via
+	// tmp+rename so a concurrent viewer process can't interleave writes.
+	imagePath := d.cachePath(sig)
+	tmpPath := fmt.Sprintf("%s.tmp%d", imagePath, os.Getpid())
 
-	file, err := os.Create(imagePath)
+	file, err := os.Create(tmpPath)
 	if err != nil {
-		return "", 0, 0, err
-	}
-	defer file.Close()
-
-	err = png.Encode(file, img)
-	if err != nil {
-		os.Remove(imagePath)
-		return "", 0, 0, err
+		return "", 0, 0, 0, 0, err
 	}
 
-	return imagePath, actualLines, imageWidthInChars, nil
+	if err = fastPNG.Encode(file, finalImg); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return "", 0, 0, 0, 0, err
+	}
+	file.Close()
+
+	c := cachedRender{
+		path:       imagePath,
+		lines:      actualLines,
+		widthChars: imageWidthInChars,
+		pxW:        actualWidth,
+		pxH:        actualHeight,
+	}
+	writeMeta(imagePath, c)
+	if err := os.Rename(tmpPath, imagePath); err != nil {
+		os.Remove(tmpPath)
+		return "", 0, 0, 0, 0, err
+	}
+
+	d.cacheStore(sig, c)
+
+	return imagePath, actualLines, imageWidthInChars, actualWidth, actualHeight, nil
 }
 
-func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, termType string) (image.Image, error) {
+func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, termType string, superSample float64) (image.Image, error) {
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
 	horizontalPadding := 4
@@ -160,13 +252,16 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	targetPixelWidth := int(float64(effectiveWidth) * pixelsPerChar * scale)
 	targetPixelHeight := int(float64(effectiveHeight) * pixelsPerLine * scale)
 
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+	// Use Bound() instead of throwaway ImageDPI(72) render
+	r, err := d.doc.Bound(pageNum)
 	if err != nil {
 		return nil, err
 	}
-	testBounds := testImg.Bounds()
-	pageWidthAt72 := testBounds.Dx()
-	pageHeightAt72 := testBounds.Dy()
+	pageWidthAt72 := r.Dx()
+	pageHeightAt72 := r.Dy()
+	if pageWidthAt72 <= 0 || pageHeightAt72 <= 0 {
+		return nil, fmt.Errorf("invalid page bounds for page %d", pageNum)
+	}
 	aspectRatio := float64(pageHeightAt72) / float64(pageWidthAt72)
 
 	var finalWidth, finalHeight int
@@ -196,6 +291,7 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	if dpiForHeight < dpi {
 		dpi = dpiForHeight
 	}
+	dpi *= superSample
 
 	if dpi < 36 {
 		dpi = 36
@@ -204,6 +300,7 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 	if termType != "kitty" {
 		maxDPI = 100.0
 	}
+	maxDPI *= superSample
 	if dpi > maxDPI {
 		dpi = maxDPI
 	}
@@ -218,6 +315,8 @@ func (d *DocumentViewer) renderPageToImage(pageNum, termWidth, termHeight int, t
 		return imgutil.SmartInvert(img), nil
 	case "invert":
 		return imgutil.SimpleInvert(img), nil
+	case "dim":
+		return imgutil.DimPage(img), nil
 	}
 	return img, nil
 }
@@ -245,7 +344,11 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		img2H = termHeight
 	}
 
-	page1Img, err := d.renderPageToImage(page1, img1W, img1H, termType)
+	superSample := superSampleFactor(termType,
+		int(float64(termWidth)*pixelsPerChar), int(float64(termHeight)*pixelsPerLine))
+	gap = int(float64(gap) * superSample) // keep separator its old on-screen width
+
+	page1Img, err := d.renderPageToImage(page1, img1W, img1H, termType, superSample)
 	if err != nil {
 		return 0
 	}
@@ -253,7 +356,7 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 
 	var page2Img image.Image
 	if hasPage2 {
-		page2Img, err = d.renderPageToImage(page2, img2W, img2H, termType)
+		page2Img, err = d.renderPageToImage(page2, img2W, img2H, termType, superSample)
 		if err != nil {
 			return 0
 		}
@@ -264,6 +367,8 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 
 	var composite *image.RGBA
 	var compositeW, compositeH int
+
+	bgColor := d.pageBackground()
 
 	if layout == "vertical" {
 		compositeW = b1.Dx()
@@ -276,10 +381,6 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 			compositeH += b2.Dy()
 		}
 
-		bgColor := color.RGBA{255, 255, 255, 255}
-		if d.darkMode != "" {
-			bgColor = color.RGBA{30, 30, 30, 255}
-		}
 		composite = image.NewRGBA(image.Rect(0, 0, compositeW, compositeH))
 		draw.Draw(composite, composite.Bounds(), &image.Uniform{bgColor}, image.Point{}, draw.Src)
 
@@ -303,10 +404,6 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 			compositeW += b2.Dx()
 		}
 
-		bgColor := color.RGBA{255, 255, 255, 255}
-		if d.darkMode != "" {
-			bgColor = color.RGBA{30, 30, 30, 255}
-		}
 		composite = image.NewRGBA(image.Rect(0, 0, compositeW, compositeH))
 		draw.Draw(composite, composite.Bounds(), &image.Uniform{bgColor}, image.Point{}, draw.Src)
 
@@ -321,34 +418,23 @@ func (d *DocumentViewer) renderDualComposite(page1, page2 int, hasPage2 bool, te
 		}
 	}
 
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return 0
-	}
-	imagePath := filepath.Join(d.tempDir, "dual.png")
-	file, err := os.Create(imagePath)
+	imagePath, err := d.saveEphemeralPNG("dual", composite)
 	if err != nil {
 		return 0
 	}
-	if err := png.Encode(file, composite); err != nil {
-		file.Close()
-		os.Remove(imagePath)
-		return 0
-	}
-	file.Close()
-	defer os.Remove(imagePath)
 
-	actualLines := int(float64(compositeH)/pixelsPerLine) + 1
+	actualLines := int(float64(compositeH)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
-	imageWidthInChars := int(float64(compositeW)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(compositeW)/pixelsPerChar/superSample) + 1
 
 	horizontalOffset := (termWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, termType)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, compositeW, compositeH, termType)
 }
 
 func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBottom bool) int {
@@ -359,26 +445,39 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	termType := d.detectTerminalType()
 	pixelsPerChar, pixelsPerLine := d.getTerminalCellSize()
 
-	testImg, err := d.doc.ImageDPI(pageNum, 72.0)
+	// Use Bound() instead of throwaway ImageDPI(72) render
+	r, err := d.doc.Bound(pageNum)
 	if err != nil {
 		return 0
 	}
-	pageHeightAt72 := testImg.Bounds().Dy()
+	pageHeightAt72 := float64(r.Dy())
+	pageWidthAt72 := float64(r.Dx())
+	if pageHeightAt72 <= 0 || pageWidthAt72 <= 0 {
+		return 0
+	}
 
-	targetCropPixels := float64(termHeight) * pixelsPerLine
+	superSample := superSampleFactor(termType,
+		int(float64(termWidth)*pixelsPerChar), int(float64(termHeight)*pixelsPerLine))
+
+	targetCropPixels := float64(termHeight) * pixelsPerLine * superSample
 	targetFullPixels := targetCropPixels / 0.55
 
 	scale := d.scaleFactor
 	if scale == 0 {
 		scale = 1.0
 	}
-	dpi := targetFullPixels / float64(pageHeightAt72) * 72.0 * scale
+	dpi := targetFullPixels / pageHeightAt72 * 72.0 * scale
 
 	if dpi < 36 {
 		dpi = 36
 	}
-	if dpi > 300 {
-		dpi = 300
+	maxDPI := 300.0
+	if termType != "kitty" {
+		maxDPI = 100.0
+	}
+	maxDPI *= superSample
+	if dpi > maxDPI {
+		dpi = maxDPI
 	}
 
 	rawImg, err := d.doc.ImageDPI(pageNum, dpi)
@@ -392,12 +491,15 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 		img = imgutil.SmartInvert(rawImg)
 	case "invert":
 		img = imgutil.SimpleInvert(rawImg)
+	case "dim":
+		img = imgutil.DimPage(rawImg)
 	}
 
 	bounds := img.Bounds()
 	fullH := bounds.Dy()
 	fullW := bounds.Dx()
 
+	// Crop enough to fill termHeight
 	targetCropH := int(targetCropPixels)
 	cropH := fullH * 55 / 100
 	if cropH < targetCropH && targetCropH <= fullH {
@@ -424,62 +526,100 @@ func (d *DocumentViewer) renderHalfPage(pageNum, termWidth, termHeight int, isBo
 	var croppedImg image.Image = cropped
 	croppedImg = imgutil.CropImage(croppedImg, userTop, userBottom, d.cropLeft, d.cropRight)
 
-	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
-		return 0
-	}
-	imagePath := filepath.Join(d.tempDir, "half.png")
-	file, err := os.Create(imagePath)
+	imagePath, err := d.saveEphemeralPNG("half", croppedImg)
 	if err != nil {
 		return 0
 	}
-	if err := png.Encode(file, croppedImg); err != nil {
-		file.Close()
-		os.Remove(imagePath)
-		return 0
-	}
-	file.Close()
-	defer os.Remove(imagePath)
 
 	cb := croppedImg.Bounds()
 	finalW := cb.Dx()
 	finalH := cb.Dy()
 
-	actualLines := int(float64(finalH)/pixelsPerLine) + 1
+	actualLines := int(float64(finalH)/pixelsPerLine/superSample) + 1
 	if actualLines > termHeight {
 		actualLines = termHeight
 	}
-	imageWidthInChars := int(float64(finalW)/pixelsPerChar) + 1
+	imageWidthInChars := int(float64(finalW)/pixelsPerChar/superSample) + 1
 
 	horizontalOffset := (termWidth - imageWidthInChars) / 2
 	if horizontalOffset < 0 {
 		horizontalOffset = 0
 	}
 
-	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, termType)
+	return d.renderWithTermImg(imagePath, actualLines, horizontalOffset, imageWidthInChars, finalW, finalH, termType)
 }
 
-func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int, termType string) int {
+func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int, horizontalOffset int, widthChars int, pixelWidth int, pixelHeight int, termType string) int {
 	if horizontalOffset > 0 {
 		fmt.Printf("\033[%dC", horizontalOffset) // Move cursor right
 	}
 
+	// Kitty path: hand the terminal the PNG already on disk instead of going
+	// through termimg, which decodes the PNG and retransmits it as raw RGBA
+	// base64 — tens of MB through the PTY per page display.
+	if termType == "kitty" {
+		newID := nextKittyImageID()
+		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines); err != nil {
+			return 0
+		}
+		// Flicker-free swap: draw new image first, then delete the old one.
+		if d.lastKittyImageID != 0 && d.lastKittyImageID != newID {
+			fmt.Printf("\033_Ga=d,d=I,i=%d\033\\", d.lastKittyImageID)
+		}
+		d.lastKittyImageID = newID
+		return estimatedLines
+	}
+
+	// Sixel terminals (Foot, xterm, etc.): pixel-based dimensions with ScaleFit
 	img, err := termimg.Open(imagePath)
 	if err != nil {
 		return 0
 	}
-
-	if termType == "kitty" {
-		// Kitty protocol handles Width/Height in cells natively
-		err = img.Width(widthChars).Height(estimatedLines).Scale(termimg.ScaleNone).Print()
-	} else {
-		// For Sixel/iTerm2: don't set Width/Height — the Sixel encoder
-		// would resize using its own font metrics, causing misalignment.
-		// The image is already at the correct pixel size from our DPI calculation.
-		err = img.Scale(termimg.ScaleNone).Print()
-	}
-	if err != nil {
+	if err := img.WidthPixels(pixelWidth).HeightPixels(pixelHeight).Scale(termimg.ScaleFit).Print(); err != nil {
 		return 0
 	}
-
 	return estimatedLines
+}
+
+// saveEphemeralPNG writes a per-frame PNG for the dual/half display paths and
+// deletes the previous frame's file. The current frame's file must outlive
+// renderWithTermImg because t=f transmission means the terminal reads the
+// file asynchronously.
+func (d *DocumentViewer) saveEphemeralPNG(prefix string, img image.Image) (string, error) {
+	if err := os.MkdirAll(d.tempDir, 0o755); err != nil {
+		return "", err
+	}
+	d.ephemeralSeq++
+	path := filepath.Join(d.tempDir, fmt.Sprintf("%s_%d.png", prefix, d.ephemeralSeq))
+
+	file, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	if err := fastPNG.Encode(file, img); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", err
+	}
+	file.Close()
+
+	// Delete the previous frame's file (it has been consumed by the terminal).
+	if d.lastEphemeralPath != "" {
+		os.Remove(d.lastEphemeralPath)
+	}
+	d.lastEphemeralPath = path
+
+	return path, nil
+}
+
+// pageBackground is the color to fill around page images: it must match what
+// the active dark mode turns paper white into.
+func (d *DocumentViewer) pageBackground() color.RGBA {
+	switch d.darkMode {
+	case "smart", "invert":
+		return color.RGBA{30, 30, 30, 255}
+	case "dim":
+		return color.RGBA{uint8(imgutil.DimPageWhite), uint8(imgutil.DimPageWhite), uint8(imgutil.DimPageWhite), 255}
+	}
+	return color.RGBA{255, 255, 255, 255}
 }
