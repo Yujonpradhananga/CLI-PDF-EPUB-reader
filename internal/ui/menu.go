@@ -18,17 +18,17 @@ const (
 	clearScreen = "\033[2J\033[H"
 
 	// Standard ANSI colors — these adapt to whatever the terminal theme is
-	fgDefault  = "\033[39m"       // terminal's default foreground
-	fgBold     = "\033[1m"        // bold (often brighter variant)
-	fgDim      = "\033[2m"        // dim
-	fgReverse  = "\033[7m"        // reverse video (swap fg/bg)
-	fgCyan     = "\033[36m"       // standard cyan (adapts to theme)
-	fgGreen    = "\033[32m"       // standard green
-	fgYellow   = "\033[33m"       // standard yellow
-	fgMagenta  = "\033[35m"       // standard magenta
-	fgBrCyan   = "\033[96m"       // bright cyan
-	fgBrGreen  = "\033[92m"       // bright green
-	fgBrWhite  = "\033[97m"       // bright white
+	fgDefault = "\033[39m" // terminal's default foreground
+	fgBold    = "\033[1m"  // bold (often brighter variant)
+	fgDim     = "\033[2m"  // dim
+	fgReverse = "\033[7m"  // reverse video (swap fg/bg)
+	fgCyan    = "\033[36m" // standard cyan (adapts to theme)
+	fgGreen   = "\033[32m" // standard green
+	fgYellow  = "\033[33m" // standard yellow
+	fgMagenta = "\033[35m" // standard magenta
+	fgBrCyan  = "\033[96m" // bright cyan
+	fgBrGreen = "\033[92m" // bright green
+	fgBrWhite = "\033[97m" // bright white
 )
 
 // plainLength returns the visible length of text (without ANSI escape codes).
@@ -127,7 +127,7 @@ func RenderMainMenu(selected int) string {
 
 	// Subtitle
 	subtitle := dim + "Terminal-based Document Viewer" + reset
-	version := dim + "v2.0.0" + reset
+	version := dim + "v.3.0" + reset
 
 	// Build menu items
 	var menuLines []string
@@ -306,10 +306,10 @@ func promptForDirectory() string {
 	drawPromptChrome()
 
 	var input []byte
-	var lastTabInput string     // input when Tab was last pressed
-	var tabCycleIndex int       // which candidate we're cycling through (-1 = common prefix)
-	var tabCandidates []string  // cached candidate list for cycling
-	var tabBaseDir string       // base dir for current tab session
+	var lastTabInput string    // input when Tab was last pressed
+	var tabCycleIndex int      // which candidate we're cycling through (-1 = common prefix)
+	var tabCandidates []string // cached candidate list for cycling
+	var tabBaseDir string      // base dir for current tab session
 
 	redrawInput("")
 

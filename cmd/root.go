@@ -21,7 +21,7 @@ func Execute() {
 			return
 		}
 		if arg == "--version" || arg == "-v" {
-			fmt.Println("pdf-cli 2.0.0")
+			fmt.Println("pdf-cli v.3.0")
 			return
 		}
 	}
