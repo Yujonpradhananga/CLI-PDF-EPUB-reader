@@ -11,15 +11,16 @@ import (
 	_ "image/png"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
-	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,23 +34,23 @@ type DocumentViewer struct {
 	textPages      []int
 	path           string
 	oldState       *term.State
-	fileType       string      // "pdf" or "epub"
-	tempDir        string      // per-process dir for ephemeral files (dual/half frames, probe)
-	cacheDir       string      // persistent cross-session render cache (falls back to tempDir)
-	forceMode      string      // "", "text", or "image" - override auto-detection
-	fitMode        string      // "auto", "height", "width"
-	wantBack       bool        // signal to go back to file picker
-	searchQuery    string      // current search query
-	searchHits     []int       // pages with matches
-	searchHitIdx   int         // current index in searchHits
-	lastModTime    time.Time   // for auto-reload detection
-	cellWidth      float64     // cached cell width in pixels
-	cellHeight     float64     // cached cell height in pixels
-	lastTermCols   int         // last known terminal columns (for change detection)
-	lastTermRows   int         // last known terminal rows (for change detection)
-	fifoPath       string      // path to FIFO for external page jump commands
-	skipClear      bool        // skip screen clear on next display (for smooth reload)
-	lastTitle      string      // last OSC-2 title written (see setTerminalTitle)
+	fileType       string    // "pdf" or "epub"
+	tempDir        string    // per-process dir for ephemeral files (dual/half frames, probe)
+	cacheDir       string    // persistent cross-session render cache (falls back to tempDir)
+	forceMode      string    // "", "text", or "image" - override auto-detection
+	fitMode        string    // "auto", "height", "width"
+	wantBack       bool      // signal to go back to file picker
+	searchQuery    string    // current search query
+	searchHits     []int     // pages with matches
+	searchHitIdx   int       // current index in searchHits
+	lastModTime    time.Time // for auto-reload detection
+	cellWidth      float64   // cached cell width in pixels
+	cellHeight     float64   // cached cell height in pixels
+	lastTermCols   int       // last known terminal columns (for change detection)
+	lastTermRows   int       // last known terminal rows (for change detection)
+	fifoPath       string    // path to FIFO for external page jump commands
+	skipClear      bool      // skip screen clear on next display (for smooth reload)
+	lastTitle      string    // last OSC-2 title written (see setTerminalTitle)
 	agterm         *agtermReporter
 	htmlPageWidth  int         // virtual page width in points for HTML layout (wider = smaller text)
 	isReflowable   bool        // true for HTML (supports layout adjustment)
@@ -135,6 +136,18 @@ type DocumentViewer struct {
 	// move between the stacks. Main-thread only.
 	backStack []viewLoc
 	fwdStack  []viewLoc
+
+	// ctlChan carries scripting requests from the control socket's accept
+	// goroutines to Run's select loop, which is the only place viewer state
+	// may be touched; ctlSocket is this process's socket path (see control.go).
+	ctlChan   chan ctlCommand
+	ctlSocket string
+
+	// ctlSnapshot is the state a status request is answered from, republished
+	// by this loop on every pass. Reading it off the main goroutine is what
+	// keeps a viewer listed and targetable while it sits in its own search
+	// prompt, go-to-page prompt, help screen or table of contents.
+	ctlSnapshot atomic.Pointer[ctlState]
 
 	// syncChan carries jump targets to Run's select loop. fifoListener feeds
 	// it from the control file; handleCtrlClick feeds it internal link
@@ -602,6 +615,14 @@ func (d *DocumentViewer) Run() bool {
 	// FIFO listener goroutine
 	go d.fifoListener(syncChan, stopChan)
 
+	// Control socket for dvctl (see control.go).
+	// Unbuffered: see serveCtlConn. A request is handed over only when this
+	// loop is at its select, so "busy" never means "queued behind a prompt".
+	ctlChan := make(chan ctlCommand)
+	d.ctlChan = ctlChan
+	d.startControlServer(stopChan)
+	defer d.cleanupControlServer()
+
 	// Input reader goroutine
 	go func() {
 		for {
@@ -621,10 +642,12 @@ func (d *DocumentViewer) Run() bool {
 	d.displayCurrentPage()
 
 	for {
+		d.publishCtlState()
 		// Wait for input, page jump, or reload tick
 		select {
 		case char := <-inputChan:
 			action := d.handleInput(char)
+			d.publishCtlState()
 			if action == 1 {
 				fmt.Print("\033[2J\033[H")
 				return d.wantBack
@@ -669,6 +692,7 @@ func (d *DocumentViewer) Run() bool {
 					}
 				})
 			}
+			d.publishCtlState()
 			d.displayCurrentPage()
 			// A click captured before this jump would map through the new
 			// page's clickMap; discard any pending coordinates so it is
@@ -676,6 +700,21 @@ func (d *DocumentViewer) Run() bool {
 			d.mouseMu.Lock()
 			d.mouseCol, d.mouseRow = 0, 0
 			d.mouseMu.Unlock()
+		case c := <-ctlChan:
+			resp, act := d.applyCtl(c.req)
+			resp.OK = resp.Error == ""
+			// Republish before answering, so a status request that follows
+			// this one on its heels sees what this command just did rather
+			// than the state from before it.
+			d.publishCtlState()
+			c.reply <- resp
+			if act.quit {
+				fmt.Print("\033[2J\033[H")
+				return act.back
+			}
+			if act.redraw {
+				d.displayCurrentPage()
+			}
 		case <-flashChan:
 			d.clearFlashRule()
 			os.Stdout.Sync()

@@ -8,6 +8,15 @@ import (
 )
 
 func main() {
+	// dvctl: the same binary controls running viewers over their sockets
+	// (see ctl.go). Reached as the dvctl symlink, or as "docviewer ctl ...".
+	if filepath.Base(os.Args[0]) == "dvctl" {
+		os.Exit(runCtl(os.Args[1:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "ctl" {
+		os.Exit(runCtl(os.Args[2:]))
+	}
+
 	// Handle --help and -h flags
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
@@ -137,6 +146,7 @@ ARGUMENTS:
 OPTIONS:
     -h, --help       Show this help message
     -v, --version    Show version
+    ctl ...          Control running viewers (see: docviewer ctl help)
 
 SUPPORTED FORMATS:
     PDF, EPUB, DOCX, HTML, PNG, JPG/JPEG
@@ -173,6 +183,11 @@ EXAMPLES:
     docviewer                    Search current directory
     docviewer ~/Documents        Search specific directory
     docviewer paper.pdf          Open file directly
+
+SCRIPTING:
+    Every running viewer listens on a socket under ~/.cache/docviewer/ctl.
+    "dvctl" (or "docviewer ctl") reads and changes any view setting from
+    outside — see "dvctl help".
 
 For LaTeX workflows, the viewer auto-reloads when the file changes.
 `
