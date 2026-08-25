@@ -1,4 +1,4 @@
-module lnreader
+module pdf-cli
 
 go 1.24.6
 

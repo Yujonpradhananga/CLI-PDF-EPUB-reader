@@ -21,7 +21,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pdf-cli/internal/control"
 )
+
+type ctlRequest = control.Request
+type ctlState = control.State
+type ctlResponse = control.Response
+type ctlTOC = control.TOC
+
+func ctlSocketDir() string { return control.SocketDir() }
 
 type ctlClient struct {
 	socket string
@@ -166,7 +175,7 @@ func ctlSplitFlags(args []string) ([]string, ctlOpts, error) {
 func ctlResolve(o ctlOpts) ([]ctlClient, error) {
 	all := ctlInstances()
 	if len(all) == 0 {
-		return nil, fmt.Errorf("no docviewer is running")
+		return nil, fmt.Errorf("no pdf-cli viewer is running")
 	}
 	if o.all {
 		return all, nil
@@ -174,7 +183,7 @@ func ctlResolve(o ctlOpts) ([]ctlClient, error) {
 	if o.target != "" {
 		m := ctlMatches(all, o.target)
 		if len(m) == 0 {
-			return nil, fmt.Errorf("no docviewer matches %q", o.target)
+			return nil, fmt.Errorf("no pdf-cli viewer matches %q", o.target)
 		}
 		return m, nil
 	}
@@ -400,9 +409,9 @@ func ctlList(opts ctlOpts) int {
 	}
 	if len(all) == 0 {
 		if opts.target != "" {
-			fmt.Fprintf(os.Stderr, "dvctl: no docviewer matches %q\n", opts.target)
+			fmt.Fprintf(os.Stderr, "dvctl: no pdf-cli viewer matches %q\n", opts.target)
 		} else {
-			fmt.Fprintln(os.Stderr, "dvctl: no docviewer is running")
+			fmt.Fprintln(os.Stderr, "dvctl: no pdf-cli viewer is running")
 		}
 		return 1
 	}
@@ -464,7 +473,7 @@ func ctlListPresets(opts ctlOpts) int {
 	return 0
 }
 
-const ctlHelp = `dvctl - control running docviewer windows
+const ctlHelp = `dvctl - control running pdf-cli viewers
 
 USAGE:
     dvctl COMMAND [ARGS] [--target T | --all] [--json] [--quiet]

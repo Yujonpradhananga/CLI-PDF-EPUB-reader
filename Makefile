@@ -1,5 +1,5 @@
-BINARY = docviewer
-PREFIX = $(HOME)/local/bin
+BINARY ?= pdf-cli
+PREFIX ?= $(HOME)/local/bin
 
 .PHONY: build install clean
 
