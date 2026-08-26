@@ -128,8 +128,8 @@ func Execute() {
 		}
 
 		ext := strings.ToLower(filepath.Ext(filePath))
-		if ext != ".pdf" && ext != ".epub" && ext != ".docx" && ext != ".html" && ext != ".htm" {
-			fmt.Printf("Unsupported file format: %s\nSupported formats: .pdf, .epub, .docx, .html\n", ext)
+		if !isSupportedExtension(ext) {
+			fmt.Printf("Unsupported file format: %s\nSupported formats: .pdf, .epub, .docx, .html, .png, .jpg\n", ext)
 			return
 		}
 
@@ -160,18 +160,19 @@ ARGUMENTS:
 OPTIONS:
     -h, --help       Show this help message
     -v, --version    Show version
+    ctl ...          Control running viewers (see: pdf-cli ctl help)
 
 SUPPORTED FORMATS:
-    PDF, EPUB, DOCX, HTML
+    PDF, EPUB, DOCX, HTML, PNG, JPG/JPEG
 
 KEYBOARD SHORTCUTS:
     Navigation:
         j, Space, Down, Right    Next page
         k, Up, Left              Previous page
         g                        Go to specific page
-        c                        Show chapter list (Table of Contents)
-        >                        Next chapter
-        <                        Previous chapter
+        T                        Table of contents (fuzzy search, Enter jumps)
+        Ctrl+Click               Follow link under click (refs, citations, URLs)
+        Cmd+Left, Cmd+Right      Back / forward through jump history
         b                        Back to file picker
 
     Search:
@@ -182,8 +183,7 @@ KEYBOARD SHORTCUTS:
     Display:
         t                        Toggle view mode (auto/text/image)
         f                        Cycle fit modes (height/width/auto)
-        i                        Toggle dark mode (smart invert, preserves hue)
-        D                        Toggle dark mode (simple invert)
+        D                        Cycle page tint (white/gray/dark/invert)
         +, =                     Zoom in
         -                        Zoom out
         r                        Refresh display (re-detect cell size)
@@ -201,6 +201,15 @@ EXAMPLES:
 For LaTeX workflows, the viewer auto-reloads when the file changes.
 `
 	fmt.Print(help)
+}
+
+func isSupportedExtension(ext string) bool {
+	switch ext {
+	case ".pdf", ".epub", ".docx", ".html", ".htm", ".png", ".jpg", ".jpeg":
+		return true
+	default:
+		return false
+	}
 }
 
 // Returns true if the user wants to go back to the main menu.
@@ -274,7 +283,7 @@ func selectFileWithPickerBroadSearch() (string, error) {
 	}
 	allFiles := searcher.GetAllFiles()
 	if len(allFiles) == 0 {
-		return "", fmt.Errorf("no PDF or EPUB files found in common directories")
+		return "", fmt.Errorf("no supported files found in common directories")
 	}
 	p := picker.NewFilePicker(searcher)
 	return p.Run()

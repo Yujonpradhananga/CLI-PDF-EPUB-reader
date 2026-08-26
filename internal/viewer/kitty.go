@@ -6,7 +6,7 @@ package viewer
 // at the 2x supersample is ~12 MP ≈ 48 MB of pixels ≈ 64 MB of base64 escape
 // data through the PTY on EVERY page display, even render-cache hits (plus a
 // full PNG decode and an RGBA copy per display). That, not MuPDF rendering, is
-// what made kitty/ghostty feel slow.
+// what made agterm/ghostty feel slow.
 //
 // Instead we hand the terminal the PNG that savePageAsImage already wrote:
 //   - t=f (file transmission): send just the base64-encoded *path* (~200 bytes);
@@ -72,6 +72,8 @@ func (d *DocumentViewer) probeKittyTransferMode() {
 
 // probeKittyFileXfer asks the terminal whether it accepts t=f file transmission
 // by sending an a=q query for a tiny probe PNG and reading the ;OK response.
+// ghostty/agterm support t=f, but this keeps us safe on terminals that don't
+// (the query is defined to not display or retain anything).
 func probeKittyFileXfer(tempDir string) bool {
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return false
@@ -106,14 +108,16 @@ func probeKittyFileXfer(tempDir string) bool {
 	fmt.Fprintf(tty, "\x1b_Ga=q,f=100,t=f,i=%d;%s\x1b\\",
 		id, base64.StdEncoding.EncodeToString([]byte(absPath)))
 
+	// Success response: ESC _ G i=<id> ; OK ESC \  — anything else (error
+	// message, no reply) means we stay on direct transmission.
 	resultChan := make(chan string, 1)
 	go func() {
 		var acc []byte
-		readBuf := make([]byte, 256)
+		buf := make([]byte, 256)
 		for {
-			n, rerr := tty.Read(readBuf)
+			n, rerr := tty.Read(buf)
 			if n > 0 {
-				acc = append(acc, readBuf[:n]...)
+				acc = append(acc, buf[:n]...)
 				if bytes.Contains(acc, []byte("\x1b\\")) {
 					resultChan <- string(acc)
 					return
@@ -139,8 +143,12 @@ func kittyDeleteImage(id uint32) {
 	fmt.Printf("\x1b_Ga=d,d=I,i=%d\x1b\\", id)
 }
 
-// clearKittyGraphics removes every placement owned by this viewer.
+// clearKittyGraphics removes every placement owned by this viewer. Redraws
+// delete the previous page as they swap in its replacement, but the final page
+// has no successor to trigger that deletion. Leaving it behind lets a z=0
+// placement cover parts of whatever the terminal draws after docviewer exits.
 func (d *DocumentViewer) clearKittyGraphics() {
+	d.clearFlashRule()
 	if d.lastKittyImageID == 0 {
 		return
 	}
@@ -148,23 +156,55 @@ func (d *DocumentViewer) clearKittyGraphics() {
 	d.lastKittyImageID = 0
 }
 
+// syncRulePNG writes (once) the overlay drawn across the page at a forward-sync
+// row: a translucent red band in the middle of an otherwise transparent tile.
+// The tile is stretched to cols x 1 cells on placement, so its width is
+// irrelevant and its height sets the band's share of a cell — 3/32 of a cell,
+// thin enough to sit across a text line without hiding it.
+func syncRulePNG(tempDir string) (string, error) {
+	path := filepath.Join(tempDir, "syncrule.png")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return "", err
+	}
+	const w, h = 8, 32
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := h/2 - 1; y <= h/2+1; y++ {
+		for x := 0; x < w; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 200, G: 30, B: 30, A: 150})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // kittySendPNG transmits an on-disk PNG at the current cursor position, scaled
 // to cols x rows cells, using the transfer mode chosen by the startup probe.
-func kittySendPNG(imagePath string, id uint32, cols, rows int) error {
+// z is the stacking order: 0 for pages, a positive value for overlays drawn on
+// top of them (the sync rule).
+func kittySendPNG(imagePath string, id uint32, cols, rows, z int) error {
 	if kittyXferMode == kittyXferFile {
 		if abs, err := filepath.Abs(imagePath); err == nil {
-			_, err = fmt.Printf("\x1b_Ga=T,f=100,t=f,i=%d,c=%d,r=%d,q=2;%s\x1b\\",
-				id, cols, rows, base64.StdEncoding.EncodeToString([]byte(abs)))
+			_, err = fmt.Printf("\x1b_Ga=T,f=100,t=f,i=%d,c=%d,r=%d,z=%d,q=2;%s\x1b\\",
+				id, cols, rows, z, base64.StdEncoding.EncodeToString([]byte(abs)))
 			return err
 		}
 		// Path resolution failed; fall through to direct transmission.
 	}
-	return kittySendPNGDirect(imagePath, id, cols, rows)
+	return kittySendPNGDirect(imagePath, id, cols, rows, z)
 }
 
 // kittySendPNGDirect streams the PNG file bytes as chunked base64 (t=d). The
 // kitty protocol caps each escape's payload at 4096 bytes of encoded data.
-func kittySendPNGDirect(imagePath string, id uint32, cols, rows int) error {
+func kittySendPNGDirect(imagePath string, id uint32, cols, rows, z int) error {
 	data, err := os.ReadFile(imagePath)
 	if err != nil {
 		return err
@@ -177,10 +217,7 @@ func kittySendPNGDirect(imagePath string, id uint32, cols, rows int) error {
 
 	first := true
 	for len(enc) > 0 {
-		n := chunkSize
-		if n > len(enc) {
-			n = len(enc)
-		}
+		n := min(chunkSize, len(enc))
 		piece := enc[:n]
 		enc = enc[n:]
 		more := 0
@@ -189,8 +226,8 @@ func kittySendPNGDirect(imagePath string, id uint32, cols, rows int) error {
 		}
 		if first {
 			first = false
-			fmt.Fprintf(&out, "\x1b_Ga=T,f=100,i=%d,c=%d,r=%d,q=2,m=%d;%s\x1b\\",
-				id, cols, rows, more, piece)
+			fmt.Fprintf(&out, "\x1b_Ga=T,f=100,i=%d,c=%d,r=%d,z=%d,q=2,m=%d;%s\x1b\\",
+				id, cols, rows, z, more, piece)
 		} else {
 			fmt.Fprintf(&out, "\x1b_Gm=%d,q=2;%s\x1b\\", more, piece)
 		}
@@ -199,6 +236,3 @@ func kittySendPNGDirect(imagePath string, id uint32, cols, rows int) error {
 	_, err = os.Stdout.WriteString(out.String())
 	return err
 }
-
-// Ensure color is used (for the probe PNG).
-var _ = color.RGBA{}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -13,14 +14,24 @@ func (d *DocumentViewer) displayCurrentPage() {
 	termWidth, termHeight := d.getTerminalSize()
 	actualPage := d.textPages[d.currentPage]
 
+	d.setTerminalTitle()
+
+	// Any previous Opt+click map is stale once we redraw; the image render
+	// paths below rebuild it (text pages leave it cleared, so clicks no-op).
+	d.clickMap = clickMap{}
+
 	// Begin synchronized update (Kitty) - buffers output for atomic display
 	fmt.Print("\033[?2026h")
 
 	if d.skipClear {
-		fmt.Print("\033_Ga=d,d=A\033\\") // Delete all Kitty images
-		fmt.Print("\033[H")              // Move cursor home
+		// Reload case (LaTeX rebuild): do NOT clear or delete anything up front.
+		// Leave the current page on screen and draw the new page over it; the old
+		// image is deleted by id afterwards (see renderWithTermImg), so the screen
+		// never blanks while the new page transmits.
+		fmt.Print("\033[H") // Move cursor home
 		d.skipClear = false
 	} else {
+		// Normal case: full screen clear
 		fmt.Print("\033[2J")
 		fmt.Print("\033[3J")
 		fmt.Print("\033[H")
@@ -30,6 +41,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	if d.dualPageMode == "half" {
 		d.displayHalfPage(termWidth, termHeight)
+		d.drawOverlays(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -37,6 +49,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 	}
 	if d.dualPageMode != "" {
 		d.displayDualPage(termWidth, termHeight)
+		d.drawOverlays(termWidth)
 		fmt.Print("\033[9999;1H")
 		fmt.Print("\033[?2026l")
 		os.Stdout.Sync()
@@ -54,17 +67,33 @@ func (d *DocumentViewer) displayCurrentPage() {
 	default:
 		d.displayTextPage(actualPage, termWidth, termHeight)
 	}
+	d.drawOverlays(termWidth)
 	fmt.Print("\033[9999;1H")
+
+	// Warm neighbor pages in the background so sequential reading is instant.
+	// Gated on the current page being an image (image-heavy docs like math PDFs).
+	// The page's links warm first: spawned ahead of the prefetch renders, the
+	// extraction takes the go-fitz mutex before they monopolize it, so a
+	// Ctrl+click moments after display is a cache hit instead of a wait.
+	if contentType == "image" {
+		if d.doc != nil {
+			go d.warmPageLinks(d.doc, actualPage)
+		}
+		d.prefetchNeighbors(termWidth, termHeight)
+	}
 
 	// End synchronized update - display everything at once
 	fmt.Print("\033[?2026l")
 	os.Stdout.Sync()
-
-	// Prefetch neighboring pages in background for instant navigation.
-	d.prefetchNeighbors(termWidth, termHeight)
 }
 
 func (d *DocumentViewer) getPageContentType(pageNum int) string {
+	// Standalone images are always rendered as images
+	if d.isImage {
+		return "image"
+	}
+
+	// Honor forced mode if set (toggled with 't')
 	if d.forceMode == "text" {
 		return "text"
 	}
@@ -72,12 +101,15 @@ func (d *DocumentViewer) getPageContentType(pageNum int) string {
 		return "image"
 	}
 
+	// For PDFs, prefer image rendering - it's more faithful to the original
+	// especially for math, diagrams, and formatted content
 	if d.fileType == "pdf" || d.fileType == "html" || d.fileType == "htm" {
 		if d.pageHasVisualContent(pageNum) {
 			return "image"
 		}
 	}
 
+	// For EPUBs or PDFs without visual content, use text-based logic
 	text, err := d.doc.Text(pageNum)
 	hasText := err == nil && len(strings.Fields(strings.TrimSpace(text))) >= 3
 	textWordCount := 0
@@ -108,7 +140,7 @@ func (d *DocumentViewer) highlightSearchMatches(line string) string {
 		return line
 	}
 	lowerLine := strings.ToLower(line)
-	query := d.searchQuery
+	query := d.searchQuery // already lowercase
 	if !strings.Contains(lowerLine, query) {
 		return line
 	}
@@ -141,7 +173,10 @@ func (d *DocumentViewer) displayTextPage(pageNum, termWidth, termHeight int) {
 	reserved := 2
 	available := termHeight - reserved
 
-	if d.darkMode != "" {
+	// Dark mode: white text on dark gray background (dim: dark text on gray)
+	if d.darkMode == "dim" {
+		fmt.Printf("\033[38;2;20;20;20m\033[48;2;%d;%d;%dm", dimPageWhite, dimPageWhite, dimPageWhite)
+	} else if d.darkMode != "" {
 		fmt.Print("\033[38;2;255;255;255m\033[48;2;30;30;30m")
 	}
 
@@ -172,17 +207,18 @@ func (d *DocumentViewer) displayTextPage(pageNum, termWidth, termHeight int) {
 	}
 
 	if d.darkMode != "" {
-		fmt.Print("\033[0m")
+		fmt.Print("\033[0m") // reset colors
 	}
 	fmt.Printf("\033[%d;1H", termHeight-1)
 	fmt.Print(strings.Repeat(" ", termWidth))
 	fmt.Printf("\033[%d;1H", termHeight)
+	// page info
 	d.displayPageInfo(pageNum, termWidth, "Text")
 }
 
 func (d *DocumentViewer) displayImagePage(pageNum, termWidth, termHeight int) {
 	reserved := 2
-	verticalPadding := 1
+	verticalPadding := 1 // top padding
 	availableHeight := termHeight - reserved - verticalPadding
 	fmt.Print("\033[1;1H")
 	fmt.Print("\r\n")
@@ -194,9 +230,6 @@ func (d *DocumentViewer) displayImagePage(pageNum, termWidth, termHeight int) {
 		fmt.Print("\033[3;1H")
 		fmt.Print("  (Image rendering failed)")
 		imageHeight = 2
-	}
-	if d.searchQuery != "" && imageHeight > 0 {
-		d.drawSearchMarkers(pageNum, termWidth, verticalPadding, imageHeight)
 	}
 	for row := imageHeight + 1 + verticalPadding; row <= termHeight-reserved; row++ {
 		fmt.Printf("\033[%d;1H", row)
@@ -233,7 +266,7 @@ func (d *DocumentViewer) displayMixedPage(pageNum, termWidth, termHeight int) {
 	if textAvailable > 0 {
 		text, err := d.doc.Text(pageNum)
 		if err == nil && strings.TrimSpace(text) != "" {
-			effectiveWidth := termWidth - 4
+			effectiveWidth := termWidth - 4 // margin
 			reflowedLines := d.reflowText(text, effectiveWidth)
 			textLinesDisplayed := 0
 			for i, line := range reflowedLines {
@@ -268,50 +301,127 @@ func (d *DocumentViewer) displayMixedPage(pageNum, termWidth, termHeight int) {
 	d.displayPageInfo(pageNum, termWidth, "Image+Text")
 }
 
-func (d *DocumentViewer) drawSearchMarkers(pageNum, termWidth, topPadding, imageHeight int) {
-	text, err := d.doc.Text(pageNum)
-	if err != nil || strings.TrimSpace(text) == "" {
-		return
-	}
-	lines := strings.Split(text, "\n")
-	totalLines := len(lines)
-	if totalLines == 0 {
-		return
-	}
+// drawOverlays paints what sits beside the page image once it is on screen:
+// the search markers and the forward-sync marker. Every display path ends with
+// it, so both follow the image into whichever view is showing.
+func (d *DocumentViewer) drawOverlays(termWidth int) {
+	d.drawSearchMarkers(termWidth)
+	d.drawFlash(termWidth)
+}
 
-	markerRows := make(map[int]bool)
-	query := d.searchQuery
-	for i, line := range lines {
-		if strings.Contains(strings.ToLower(line), query) {
-			row := topPadding + 1 + int(float64(i)/float64(totalLines)*float64(imageHeight))
-			if row < topPadding+1 {
-				row = topPadding + 1
+// drawSearchMarkers paints a yellow block in the margin beside every row of a
+// displayed page holding a search match. It reads the clickMap the render path
+// just rebuilt, so one implementation covers every image view — single page,
+// both 2-page layouts, half page — and each match sits on the row that shows
+// its own line rather than an estimate from its position in the page text. A
+// match cropped away, or in the half not on screen, has no cell and draws
+// nothing. Text pages leave the clickMap cleared and get no markers; they
+// highlight their matches inline instead.
+func (d *DocumentViewer) drawSearchMarkers(termWidth int) {
+	if d.searchQuery == "" || d.doc == nil {
+		return
+	}
+	drawn := make(map[[2]int]bool)
+	for _, t := range d.clickMap.targets {
+		for _, line := range d.searchLines(t.page0) {
+			if !strings.Contains(line.text, d.searchQuery) {
+				continue
 			}
-			if row > topPadding+imageHeight {
-				row = topPadding + imageHeight
+			col, row, ok := d.clickMap.markerCell(t.page0, line.y, termWidth)
+			if !ok || drawn[[2]int{col, row}] {
+				continue
 			}
-			markerRows[row] = true
+			drawn[[2]int{col, row}] = true
+			fmt.Printf("\033[%d;%dH", row, col)
+			fmt.Print("\033[43m \033[0m") // yellow block
 		}
-	}
-
-	for row := range markerRows {
-		fmt.Printf("\033[%d;%dH", row, termWidth)
-		fmt.Print("\033[43m \033[0m")
 	}
 }
 
+// drawFlash paints the forward-sync marker recorded by setFlash, using the
+// clickMap the render path above just rebuilt: bold red ▶ / ◀ in the margin
+// columns immediately left and right of the image at the target row, plus a
+// thin red rule across the page at that row for the first flashRuleWindow
+// after the jump.
+//
+// Like drawSearchMarkers, the margin glyphs draw beside the image rather than
+// over it: kittySendPNG places pages at z-index 0, which the kitty graphics
+// protocol stacks above text, so a glyph at the target cell itself would be
+// covered. The rule instead goes over the page as its own graphics placement
+// at z=1, which is why it exists only on kitty-protocol terminals.
+//
+// The marker persists across redraws (reload, zoom, crop) while its page is
+// on screen; once the page is no longer displayed it is cleared for good. A
+// point on a displayed page that is itself hidden (cropped off, other half in
+// half-page mode) keeps the marker armed without drawing.
+func (d *DocumentViewer) drawFlash(termWidth int) {
+	if !d.flash.active {
+		d.clearFlashRule()
+		return
+	}
+	if !d.clickMap.hasPage(d.flash.page0) {
+		d.flash = flashState{}
+		d.clearFlashRule()
+		return
+	}
+	_, row, ok := d.clickMap.pdfToCell(d.flash.page0, d.flash.x, d.flash.y)
+	if !ok {
+		d.clearFlashRule()
+		return
+	}
+	leftCol := d.clickMap.originCol - 1
+	if leftCol < 1 {
+		leftCol = 1
+	}
+	rightCol := d.clickMap.originCol + d.clickMap.cols
+	if rightCol > termWidth {
+		rightCol = termWidth
+	}
+	fmt.Printf("\033[%d;%dH\033[1;31m▶\033[0m", row, leftCol)
+	fmt.Printf("\033[%d;%dH\033[1;31m◀\033[0m", row, rightCol)
+	d.drawFlashRule(row)
+}
+
+// drawFlashRule places the thin overlay line across the image at the given
+// row, replacing any previous placement. A page image drawn after the last
+// rule would sit under it forever, so every redraw re-places (or drops) it.
+func (d *DocumentViewer) drawFlashRule(row int) {
+	d.clearFlashRule()
+	if time.Now().After(d.flashUntil) || d.detectTerminalType() != "kitty" {
+		return
+	}
+	path, err := syncRulePNG(d.tempDir)
+	if err != nil {
+		return
+	}
+	id := nextKittyImageID()
+	fmt.Printf("\033[%d;%dH", row, d.clickMap.originCol)
+	if err := kittySendPNG(path, id, d.clickMap.cols, 1, 1); err != nil {
+		return
+	}
+	d.flashRuleID = id
+}
+
+// clearFlashRule removes the overlay line from the screen if one is placed.
+func (d *DocumentViewer) clearFlashRule() {
+	if d.flashRuleID == 0 {
+		return
+	}
+	kittyDeleteImage(d.flashRuleID)
+	d.flashRuleID = 0
+}
+
 // statusIndicators returns the trailing indicator group shared by every status
-// bar: fit, zoom, dark mode, crop, search, and the file type. (Ported from
-// upstream's refactor; chapter info stays out of this shared helper since only
-// the single-page text view has chapters — see displayPageInfo.)
+// bar: fit, zoom, dark mode, crop, search, and the file type.
 func (d *DocumentViewer) statusIndicators() string {
 	fitIndicator := fmt.Sprintf(" [fit:%s]", d.fitMode)
 	scaleIndicator := ""
 	if d.isReflowable {
+		// Show zoom as percentage relative to A4 width (595pt)
 		zoomPct := 595 * 100 / d.htmlPageWidth
 		scaleIndicator = fmt.Sprintf(" [zoom:%d%%]", zoomPct)
-	} else if d.scaleFactor != 1.0 {
-		scaleIndicator = fmt.Sprintf(" [%.0f%%]", d.scaleFactor*100)
+	} else if z := d.zoom(); z != 1.0 {
+		scaleIndicator = fmt.Sprintf(" [%.0f%%]", z*100)
 	}
 	darkIndicator := ""
 	switch d.darkMode {
@@ -319,6 +429,8 @@ func (d *DocumentViewer) statusIndicators() string {
 		darkIndicator = " [dark]"
 	case "invert":
 		darkIndicator = " [dark:inv]"
+	case "dim":
+		darkIndicator = " [dim]"
 	}
 	cropIndicator := ""
 	if d.cropTop > 0 || d.cropBottom > 0 || d.cropLeft > 0 || d.cropRight > 0 {
@@ -335,6 +447,46 @@ func (d *DocumentViewer) statusIndicators() string {
 	return fmt.Sprintf("%s%s%s%s%s - %s",
 		fitIndicator, scaleIndicator, darkIndicator, cropIndicator, searchIndicator,
 		strings.ToUpper(d.fileType))
+}
+
+// setTerminalTitle reports the file name and page position as the OSC 2 window
+// title. agterm shows that title in its sidebar and session picker, so a reader
+// left open in another session says which document is on which page; tmux and
+// ssh forward it, and terminals that ignore OSC 2 drop it harmlessly. Rewritten
+// only when it changes, since a redraw happens on every keystroke.
+func (d *DocumentViewer) setTerminalTitle() {
+	pos := fmt.Sprintf("%d/%d", d.currentPage+1, len(d.textPages))
+	if d.pageStep() == 2 && d.currentPage+1 < len(d.textPages) {
+		pos = fmt.Sprintf("%d-%d/%d", d.currentPage+1, d.currentPage+2, len(d.textPages))
+	}
+	title := fmt.Sprintf("%s %s %s", titleIcon(d.fileType), filepath.Base(d.path), pos)
+	if title == d.lastTitle {
+		return
+	}
+	d.lastTitle = title
+	fmt.Printf("\x1b]2;%s\x07", title)
+	d.agterm.report(title)
+}
+
+// titleIcon marks the title as a document at a glance in a list of sessions
+// that are otherwise shells and agents.
+func titleIcon(fileType string) string {
+	switch fileType {
+	case "epub":
+		return "📗"
+	case "html", "htm":
+		return "🌐"
+	case "png", "jpg", "jpeg":
+		return "🖼"
+	default:
+		return "📕"
+	}
+}
+
+// clearTerminalTitle hands the title back on exit; the shell's next prompt sets
+// its own.
+func clearTerminalTitle() {
+	fmt.Print("\x1b]2;\x07")
 }
 
 // drawStatusBar writes the centered status line at the cursor: the file name,
@@ -368,21 +520,8 @@ func (d *DocumentViewer) displayPageInfo(pageNum, termWidth int, contentType str
 	if d.forceMode != "" {
 		modeIndicator = fmt.Sprintf(" [%s]", d.forceMode)
 	}
-	// Chapter indicator is fork-specific (epub support) and has no place in
-	// the shared statusIndicators() helper, so it's built here and spliced in
-	// right after the mode indicator.
-	chapterIndicator := ""
-	if len(d.chapters) > 0 {
-		d.updateCurrentChapter()
-		ch := d.chapters[d.currentChapter]
-		title := ch.Title
-		if len(title) > 30 {
-			title = title[:27] + "..."
-		}
-		chapterIndicator = fmt.Sprintf(" [Ch %d/%d: %s]", d.currentChapter+1, len(d.chapters), title)
-	}
-	d.drawStatusBar(termWidth, fmt.Sprintf("Page %d/%d (%s)%s%s%s",
-		d.currentPage+1, len(d.textPages), contentType, modeIndicator, chapterIndicator, d.statusIndicators()))
+	d.drawStatusBar(termWidth, fmt.Sprintf("Page %d/%d (%s)%s%s",
+		d.currentPage+1, len(d.textPages), contentType, modeIndicator, d.statusIndicators()))
 }
 
 // halfPageViewHeight is the number of rows the half-page image may use: the
@@ -516,7 +655,7 @@ func (d *DocumentViewer) normalizeWhitespace(text string) string {
 
 func (d *DocumentViewer) wrapText(text string, width int) []string {
 	if width <= 0 {
-		width = 80
+		width = 80 // Fallback
 	}
 	if width < 20 {
 		width = 20
@@ -544,7 +683,7 @@ func (d *DocumentViewer) wrapText(text string, width int) []string {
 		}
 		proposedLength := currentLine.Len()
 		if proposedLength > 0 {
-			proposedLength += 1
+			proposedLength += 1 // for the space
 		}
 		proposedLength += len(word)
 		if proposedLength <= width {
@@ -566,11 +705,104 @@ func (d *DocumentViewer) wrapText(text string, width int) []string {
 	return lines
 }
 
+func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
+	fmt.Print("\033[2J\033[H") // clear screen
+	termWidth, _ := d.getTerminalSize()
+
+	// Helper: print line with \r\n for raw mode
+	p := func(s string) { fmt.Print(s + "\r\n") }
+
+	p(strings.Repeat("=", termWidth))
+	p(fmt.Sprintf("%s Viewer Help", strings.ToUpper(d.fileType)))
+	p(strings.Repeat("=", termWidth))
+	p("")
+	p("Navigation:")
+	p("  j/Space/Down/Right  - Next page (next spread in 2-page mode)")
+	p("  k/Up/Left           - Previous page (previous spread in 2-page mode)")
+	p("  g                   - Go to specific page")
+	p("  T                   - Table of contents (fuzzy search, Enter jumps)")
+	p("  Ctrl+I / Ctrl+O     - Back / forward through jump history")
+	p("  b                   - Back to file list")
+	p("")
+	p("Search:")
+	p("  /                   - Search text in document")
+	p("  n                   - Next search result")
+	p("  N                   - Previous search result")
+	p("")
+	p("Display:")
+	p("  t                   - Toggle view mode (auto/text/image)")
+	p("  f                   - Cycle fit mode (height/width/auto)")
+	p("  D                   - Cycle page tint (white/gray/dark/invert)")
+	p("  +/-                 - Zoom in/out (10%-200%, kept per view)")
+	p("  2                   - Cycle view (off/vertical/horizontal/half-page)")
+	p("  Shift+Left/Right    - Move a single page (offsets a 2-page spread)")
+	p("  Arrow/j/k           - Navigate by half-page (in half-page mode)")
+	p("  r                   - Refresh cell size (after resolution change)")
+	p("")
+	p("Crop (trim page edges, session-only):")
+	p("  {                   - Crop top edge (press multiple times)")
+	p("  }                   - Crop bottom edge")
+	p("  [                   - Crop left edge")
+	p("  ]                   - Crop right edge")
+	p("  Cmd+Opt+Shift+[     - Uncrop top edge (inverse of {)")
+	p("  Cmd+Opt+Shift+]     - Uncrop bottom edge (inverse of })")
+	p("  Cmd+Opt+[           - Uncrop left edge (inverse of [)")
+	p("  Cmd+Opt+]           - Uncrop right edge (inverse of ])")
+	p("  \\                   - Reset all crops")
+	p("  d                   - Show debug info")
+	p("  S                   - Open in Skim")
+	p("  P                   - Open in Preview")
+	p("  O                   - Reveal in Finder")
+	p("  v                   - Jump vim to this page's source (synctex)")
+	p("  Opt+Click           - Jump vim to clicked line (synctex)")
+	p("  Ctrl+Click          - Follow link under click (refs, citations, URLs)")
+	p("  h or ?              - Show this help")
+	p("  q                   - Quit")
+	p("")
+	p("Features:")
+	p("  - Auto-reload when file changes (for LaTeX workflows)")
+	p("  - Text is reflowed to fit terminal width")
+	p("  - Images rendered via Kitty/Sixel/iTerm2 graphics")
+	if d.fileType == "epub" {
+		p("  - HTML entities are converted to readable text")
+	}
+	p("")
+	p("Supported formats: PDF, EPUB, DOCX, HTML, PNG, JPG")
+	p("")
+	p(strings.Repeat("=", termWidth))
+	p("Press any key to return...")
+	<-inputChan
+}
+
+func (d *DocumentViewer) showDebugInfo(inputChan <-chan byte) {
+	fmt.Print("\033[2J\033[H") // clear screen
+	cols, rows := d.getTerminalSize()
+	cellW, cellH := d.getTerminalCellSize()
+	pixelW, pixelH := d.getTerminalPixelSize()
+
+	p := func(s string) { fmt.Print(s + "\r\n") }
+	p("=== Debug Info ===")
+	p(fmt.Sprintf("Terminal size: %d cols x %d rows", cols, rows))
+	p(fmt.Sprintf("Cell size: %.1f x %.1f pixels", cellW, cellH))
+	p(fmt.Sprintf("Pixel size (TIOCGWINSZ): %d x %d", pixelW, pixelH))
+	p(fmt.Sprintf("Calculated terminal pixels: %.0f x %.0f", float64(cols)*cellW, float64(rows)*cellH))
+	p(fmt.Sprintf("Fit mode: %s", d.fitMode))
+	p(fmt.Sprintf("Scale factor: %.1f (%s view)", d.zoom(), d.viewKey()))
+	xfer := "direct (chunked PNG)"
+	if kittyXferMode == kittyXferFile {
+		xfer = "file (t=f)"
+	}
+	p(fmt.Sprintf("Kitty transfer mode: %s", xfer))
+	p("")
+	p("Press any key to return...")
+	<-inputChan
+}
+
 func (d *DocumentViewer) displayDualPage(termWidth, termHeight int) {
 	page1 := d.textPages[d.currentPage]
 	hasPage2 := d.currentPage+1 < len(d.textPages)
 
-	reserved := 2
+	reserved := 2 // status bar
 
 	if d.dualPageMode == "vertical" {
 		d.displayDualVertical(page1, hasPage2, termWidth, termHeight, reserved)
@@ -593,6 +825,7 @@ func (d *DocumentViewer) displayDualVertical(page1 int, hasPage2 bool, termWidth
 		fmt.Printf("  [Render failed]")
 	}
 
+	// Status bar
 	fmt.Printf("\033[%d;1H", termHeight)
 	d.displayDualPageInfo(hasPage2, termWidth, "2pg-v")
 }
@@ -611,6 +844,7 @@ func (d *DocumentViewer) displayDualHorizontal(page1 int, hasPage2 bool, termWid
 		fmt.Printf("  [Render failed]")
 	}
 
+	// Status bar
 	fmt.Printf("\033[%d;1H", termHeight)
 	d.displayDualPageInfo(hasPage2, termWidth, "2pg-h")
 }

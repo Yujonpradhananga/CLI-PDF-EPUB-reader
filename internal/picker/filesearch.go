@@ -30,7 +30,7 @@ func NewFileSearcher() *FileSearcher {
 	}
 }
 
-// ScanDirectories scans common directories for PDF/EPUB/DOCX files.
+// ScanDirectories scans common directories for supported documents and images.
 func (fs *FileSearcher) ScanDirectories() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -50,7 +50,7 @@ func (fs *FileSearcher) ScanDirectories() error {
 
 	const maxDepth = 5
 
-	fmt.Println("Scanning for PDF and EPUB files...")
+	fmt.Println("Scanning for documents and images...")
 
 	uniqueFiles := make(map[string]bool)
 
@@ -87,7 +87,7 @@ func (fs *FileSearcher) ScanDirectories() error {
 			}
 
 			ext := strings.ToLower(filepath.Ext(path))
-			if ext == ".pdf" || ext == ".epub" || ext == ".docx" {
+			if isSupportedExtension(ext) {
 				uniqueFiles[path] = true
 			}
 
@@ -126,7 +126,7 @@ func (fs *FileSearcher) ScanDirectory(dir string) error {
 		}
 
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".pdf" || ext == ".epub" || ext == ".docx" || ext == ".html" || ext == ".htm" {
+		if isSupportedExtension(ext) {
 			files = append(files, path)
 		}
 
@@ -138,6 +138,15 @@ func (fs *FileSearcher) ScanDirectory(dir string) error {
 
 	fs.files = files
 	return nil
+}
+
+func isSupportedExtension(ext string) bool {
+	switch ext {
+	case ".pdf", ".epub", ".docx", ".html", ".htm", ".png", ".jpg", ".jpeg":
+		return true
+	default:
+		return false
+	}
 }
 
 // Search performs a fuzzy search on the file list.

@@ -7,30 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
-// renderParams is a snapshot of every viewer field that affects a rendered page.
-// Captured on the main thread by snapshotParams(), then passed to background
-// goroutines (prefetch) so they never race on viewer state.
-type renderParams struct {
-	pixelsPerChar  float64
-	pixelsPerLine  float64
-	scaleFactor    float64
-	fitMode        string
-	darkMode       string
-	cropTop        float64
-	cropBottom     float64
-	cropLeft       float64
-	cropRight      float64
-	dualPageMode   string
-	halfPageOffset int
-	htmlPageWidth  int
-	lastMod        int64
-}
-
-// cachedRender holds the on-disk path and placement geometry for a rendered page.
+// cachedRender is a fully-rendered single page on disk plus the geometry the
+// caller needs to place it (return values of savePageAsImage).
 type cachedRender struct {
 	path       string
 	lines      int
@@ -39,14 +20,34 @@ type cachedRender struct {
 	pxH        int
 }
 
-// snapshotParams captures the current viewer state into a renderParams.
-// Must be called on the main thread.
+// renderParams is a snapshot of every viewer field that affects a rendered page.
+// It is captured on the main thread so the background prefetch goroutine never
+// reads mutable viewer state directly (avoids a data race with key handling).
+type renderParams struct {
+	pixelsPerChar float64
+	pixelsPerLine float64
+	scaleFactor   float64
+	fitMode       string
+	darkMode      string
+	cropTop       float64
+	cropBottom    float64
+	cropLeft      float64
+	cropRight     float64
+	// included in the cache signature only:
+	dualPageMode   string
+	halfPageOffset int
+	htmlPageWidth  int
+	lastMod        int64
+}
+
+// snapshotParams captures the current render-affecting state. Call on the main
+// thread (it reads cached cell size and viewer fields).
 func (d *DocumentViewer) snapshotParams() renderParams {
 	pc, pl := d.getTerminalCellSize()
 	return renderParams{
 		pixelsPerChar:  pc,
 		pixelsPerLine:  pl,
-		scaleFactor:    d.scaleFactor,
+		scaleFactor:    d.zoom(),
 		fitMode:        d.fitMode,
 		darkMode:       d.darkMode,
 		cropTop:        d.cropTop,
@@ -68,8 +69,8 @@ const maxCachedPages = 48
 // survive; cache hits touch the file, giving approximate LRU).
 const maxPersistentCached = 200
 
-// persistentCacheDir returns the cross-session render cache directory,
-// or "" if it can't be created.
+// persistentCacheDir returns the cross-session render cache directory
+// (~/Library/Caches/docviewer on macOS), or "" if it can't be created.
 func persistentCacheDir() string {
 	base, err := os.UserCacheDir()
 	if err != nil {
@@ -84,6 +85,9 @@ func persistentCacheDir() string {
 
 // renderSig is a cache key covering everything that changes a rendered page.
 // If any of these differ, the cached image is stale and must be re-rendered.
+// rp.lastMod busts the cache on auto-reload. Cell pixel size matters for the
+// persistent cache: across sessions the same cols x rows can be a different
+// monitor/font, i.e. different pixel dimensions.
 func renderSig(pageNum, termWidth, termHeight int, termType string, rp renderParams) string {
 	return fmt.Sprintf("p%d|w%d|h%d|t%s|f%s|s%.3f|d%s|dp%s|ho%d|c%.4f,%.4f,%.4f,%.4f|hw%d|m%d|px%.2fx%.2f|ss%.2f",
 		pageNum, termWidth, termHeight, termType, rp.fitMode, rp.scaleFactor, rp.darkMode,
@@ -92,7 +96,8 @@ func renderSig(pageNum, termWidth, termHeight int, termType string, rp renderPar
 }
 
 // cachePath returns a stable filename in the persistent cache dir, keyed by
-// the document's absolute path plus the render signature.
+// the document's absolute path plus the render signature (the signature alone
+// isn't unique across documents once the cache dir is shared).
 func (d *DocumentViewer) cachePath(sig string) string {
 	absPath, _ := filepath.Abs(d.path)
 	h := fnv.New64a()
@@ -224,9 +229,10 @@ func (d *DocumentViewer) cacheStore(sig string, c cachedRender) {
 }
 
 // prefetchNeighbors renders the next/previous logical pages into the cache in the
-// background so sequential reading feels instant.
+// background so sequential reading feels instant. Called on the main thread for
+// the single-page image path; a no-op when dual/half/reflow mode is active.
 func (d *DocumentViewer) prefetchNeighbors(termWidth, termHeight int) {
-	if d.dualPageMode != "" || d.isReflowable {
+	if d.dualPageMode != "" || d.isReflowable || d.isImage {
 		return
 	}
 	// Match displayImagePage's available height (reserved 2 + top padding 1).
@@ -273,16 +279,3 @@ func (d *DocumentViewer) warmPage(pageNum, maxWidth, maxHeight int, termType str
 	// savePageAsImage populates the cache as a side effect.
 	d.savePageAsImage(pageNum, maxWidth, maxHeight, termType, rp)
 }
-
-// clearRenderCache drops all in-memory cache entries. Called on reload.
-func (d *DocumentViewer) clearRenderCache() {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
-	d.renderCache = make(map[string]cachedRender)
-	d.cacheOrder = nil
-	d.inFlight = make(map[string]bool)
-}
-
-// prefetchLock is not needed as a separate type; the cacheMu on DocumentViewer
-// guards all cache state including inFlight.
-var _ sync.Mutex // ensure sync is used

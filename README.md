@@ -7,7 +7,7 @@
 ![Last Commit](https://img.shields.io/github/last-commit/Yujonpradhananga/pdf-cli?style=for-the-badge&labelColor=181825&color=a6e3a1)
 
 </div>
-A terminal-based PDF, EPUB and DOCX viewer with fuzzy file search, high-resolution image rendering, auto-reload for LaTeX workflows intelligent text reflow and double page mode.
+A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file search, high-resolution rendering, fast page caching, LaTeX auto-reload, intelligent text reflow, and multi-page viewing modes.
 
 <https://github.com/user-attachments/assets/7ba77b3f-7f7a-48aa-bf70-1f432650bdf1>
 
@@ -16,16 +16,19 @@ A terminal-based PDF, EPUB and DOCX viewer with fuzzy file search, high-resoluti
 - **Fuzzy File Search**: Interactive file picker with fuzzy search to quickly find your PDFs and EPUBs
 - **Smart Content Detection**: Automatically detects and displays text, images, or mixed content pages
 - **High-Resolution Image Rendering**: Uses terminal graphics protocols (Sixel/Kitty/iTerm2) for crisp image display
-- **Half Page View**:Supports screen splitting to display pages in halfpage view with high quality rendering.
+- **Render Cache and Prefetch**: Caches rendered pages and prepares neighboring pages in the background
+- **Half Page View**: Supports screen splitting to display half pages at high quality
 - **Image Invert**: Inverts the Image while preserving the core colors of the image.
 - **HiDPI/Retina Support**: Dynamic cell size detection for sharp rendering on high-DPI displays
 - **Auto-Reload**: Automatically reloads when the PDF changes (perfect for LaTeX compilation with `latexmk -pvc`)
 - **Fit Modes**: Toggle between height-fit, width-fit, and auto-fit modes
 - **Manual Zoom**: Adjust zoom from 10% to 200%
 - **In-Document Search**: Search for text within documents
+- **Navigation Tools**: Follow document links, browse jump history, and fuzzy-search the table of contents
+- **Viewer Control**: Inspect and control running viewers with `dvctl` or `pdf-cli ctl`
 - **Intelligent Text Reflow**: Automatically reformats text to fit your terminal width while preserving paragraphs
 - **Terminal-Aware**: Detects your terminal type and optimizes rendering accordingly
-- **Multiple Formats**: Supports PDF, EPUB, and DOCX documents
+- **Multiple Formats**: Supports PDF, EPUB, DOCX, HTML, PNG, and JPEG files
 
 ## Keyboard Shortcuts
 
@@ -34,12 +37,16 @@ A terminal-based PDF, EPUB and DOCX viewer with fuzzy file search, high-resoluti
 | `j` / `Space` / `Down` / `Right` | Next page |
 | `k` / `Up` / `Left` | Previous page |
 | `g` | Go to specific page |
+| `T` | Table of contents overlay (fuzzy search, Enter jumps) |
+| `Ctrl+Click` | Follow links, references, citations, and URLs |
+| `Cmd+Left` / `Cmd+Right` | Move backward or forward through jump history |
 | `b` | Back to file picker |
 | `/` | Search in document |
 | `n` | Next search result |
 | `N` | Previous search result |
 | `t` | Toggle text/image/auto mode |
 | `f` | Cycle fit modes (height/width/auto) |
+| `D` | Cycle page tint (white/gray/dark/invert) |
 | `+` / `=` | Zoom in |
 | `-` | Zoom out |
 | `r` | Refresh display (re-detect cell size) |
@@ -88,6 +95,9 @@ go build -o pdf-cli .
 
 # Optionally move to your PATH
 mv pdf-cli ~/local/bin/
+
+# Or build and install pdf-cli plus the dvctl symlink
+make install
 ```
 
 ### Usage
@@ -101,6 +111,9 @@ pdf-cli ~/Documents/papers/
 
 # Open a specific file directly
 pdf-cli paper.pdf
+
+# Inspect a running viewer
+pdf-cli ctl status
 ```
 
 ## LaTeX Workflow
@@ -136,7 +149,7 @@ Works in any terminal, but image rendering quality depends on terminal capabilit
 
 ## How It Works
 
-The reader scans the current directory (or specified directory) for PDF, EPUB, and DOCX files. Use the fuzzy search to quickly filter and select a file. The viewer intelligently detects whether pages contain text, images, or both, and renders them appropriately for terminal display.
+The reader scans the current directory (or specified directory) for supported documents and images. Use the fuzzy search to quickly filter and select a file. The viewer intelligently detects whether document pages contain text, images, or both, and renders them appropriately for terminal display.
 
 PDFs are rendered as images by default (essential for math, diagrams, and formatted content) at a DPI calculated to match your terminal's pixel dimensions for optimal sharpness.
 
